@@ -1,0 +1,120 @@
+# Helm values.yaml for code-server deployment
+# This file configures the deployment with namespace, PVC, secret, deployment, and service.
+# To enable interactive prompts during helm install, use helm install --set parameters
+# For example: helm install app . --set secret.password='<interactive-password>';
+
+# Namespace for the deployment
+namespace: "code-server"
+
+# Global settings for defaults
+global:
+  # PersistentVolumeClaim configuration
+  persistentVolumeClaim:
+    size: "10Gi"  # Default size, override with --set global.persistentVolumeClaim.size='<desired-size>Gi'
+
+  # Secret for code-server password
+  secret:
+    name: "code-server-password"
+    password: "defaultpassword"  # Default placeholder, override with --set global.secret.password='<your-password>'
+    # Note: For interactive prompt, run: helm install --ask-values or set via --set
+
+# Deployment configuration for code-server
+deployment:
+  image:
+    repository: "ghcr.io/coder/code-server"
+    tag: "latest"
+  replicas: 1
+  env:
+    - name: PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: code-server-password  # Reference to the secret above
+          key: password
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+  # Volume mount for persistent storage
+  volumeMounts:
+    - name: data-vol
+      mountPath: "/home/coder/project"
+  volumes:
+    - name: data-vol
+      persistentVolumeClaim:
+        claimName: "code-server-pvc"  # Reference to PVC below
+
+# PersistentVolumeClaim
+persistentVolumeClaim:
+  name: "code-server-pvc"
+  size: "10Gi"  # Uses global.persistentVolumeClaim.size, can be overridden interactively
+  accessModes:
+    - "ReadWriteOnce"
+  storageClassName: ""  # Leave empty for default or specify if needed
+
+# Secret for code-server password
+secret:
+  name: "code-server-password"
+  type: "Opaque"
+  data:
+    password: "defaultpassword"  # Base64 encoded if needed, but here plain for simplicity; override interactively
+
+# Service configuration
+service:
+  name: "code-server-service"
+  type: "LoadBalancer"  # Default to LoadBalancer, override with --set service.type='ClusterIP' for headless or internal
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  annotations:
+    # For logging and monitoring
+    kubernetes.io/ingress.class: "nginx"  # Example annotation for ingress integration if needed
+    # Add error handling/logging via sidecar if required, but not defined here for simplicity
+
+# Spot-specific configurations
+spot:
+  # Webhook endpoints for preemption monitoring (configure external endpoints)
+  webhooks:
+    preemption:
+      url: "https://webhook.example.com/preemption-handler"
+      events: ["preemption"]
+      warningMinutes: 5
+      enabled: false  # Set to true to enable
+    marketUpdates:
+      url: "https://webhook.example.com/market-updates"
+      events: ["price-change"]
+      enabled: false
+
+  # Bid management settings
+  bid:
+    strategy: "optimized"  # conservative, balanced, aggressive, custom
+    markup: 0.10  # multiplier for market price (0.10 = 10% markup)
+    minBid: 0.01  # minimum bid floor
+    maxBid: 1.0   # maximum bid ceiling
+
+  # Graceful shutdown settings
+  shutdown:
+    preemptionGracePeriod: 300  # seconds to wait for preemption handling
+    webhookTimeout: 10         # seconds for webhook calls
+
+  # Market monitoring
+  monitoring:
+    priceUpdateInterval: 300  # seconds between price updates
+    bidAdjustmentThreshold: 0.05  # trigger adjustment when price change > 5%
+
+# Additional configurations for idempotency: Ensure resources have stable names to avoid recreation on re-deploy
+# Use labels for better resource management
+metadata:
+  labels:
+    app: code-server
+    version: v1.0
+    spot-enabled: "true"
+
+# Notes for Helm installation:
+# - To prompt interactively (simulate): Run `helm install app . --set global.secret.password='<password>' --set global.persistentVolumeClaim.size='<size>' --set service.type='<LoadBalancer|ClusterIP>'`
+# - Add --dry-run to validate before actual deployment.
+# - Include error handling in your Helm chart templates using checks for missing values.
+# - Spot configurations can be enabled with --set spot.webhooks.preemption.enabled=true --set spot.bid.strategy=balanced

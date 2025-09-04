@@ -1,0 +1,48 @@
+# template-values.yaml: Helm values template for PascalIske code-server chart
+# This file uses placeholder variables replaced by deploy-code-server.sh
+# Placeholders: ${NAMESPACE}, ${STORAGE_SIZE}, ${CODE_SERVER_PASSWORD}, ${TIMEZONE}, ${SERVICE_TYPE}
+
+# Image configuration for code-server
+image:
+  repository: codercom/code-server
+  tag: latest
+
+# Volume configuration - use existing PVC created by Terraform
+volume:
+  enabled: true
+  existingClaim: code-server-pvc
+  size: ${STORAGE_SIZE}  # Not used if existingClaim is set, but kept for reference
+
+# Injector configuration (default for the chart)
+injector:
+  image:
+    repository: ghcr.io/pascaliske/injector
+    tag: latest
+
+# Config environment variables for code-server
+config:
+  env:
+    - name: PASSWORD
+      value: "${CODE_SERVER_PASSWORD}"
+    - name: TZ
+      value: "${TIMEZONE}"
+  yaml: ""
+
+# Service configuration
+service:
+  type: ${SERVICE_TYPE}
+  port: 80
+  annotations: {}
+
+# Ingress disabled since using LoadBalancer or ClusterIP
+ingress:
+  enabled: false
+
+# Spot-specific environment variables
+env:
+  - name: SPOT_REGION
+    value: "${SPOT_REGION}"
+  - name: SPOT_GENERATION
+    value: "${SPOT_GENERATION}"
+  - name: SPOT_WEBHOOK_URL
+    value: "${SPOT_WEBHOOK_URL}"
