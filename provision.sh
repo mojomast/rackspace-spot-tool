@@ -7,13 +7,55 @@ source scripts/helpers.sh
 # This script prompts for necessary variables with defaults, initializes and applies Terraform for infrastructure,
 # sets up KUBECONFIG, installs code-server via Helm, waits for pods to be ready, and provides access instructions.
 
-main() {
-    set -e  # Exit on any error for safety
+# Cleanup function for trap handlers
+cleanup() {
+    local exit_code=$?
+    log "INFO" "Starting cleanup..."
 
-    # Parse command line arguments
+    # Clean up temporary kubeconfig if it exists
+    if [ -n "$TMP_KUBECONFIG" ] && [ -f "$TMP_KUBECONFIG" ]; then
+        rm -f "$TMP_KUBECONFIG"
+        log "INFO" "Cleaned up temporary kubeconfig"
+    fi
+
+    # Clean up temporary Terraform directory if it exists
+    if [ -n "$TF_TMP_DIR" ] && [ -d "$TF_TMP_DIR" ]; then
+        rm -rf "$TF_TMP_DIR"
+        log "INFO" "Cleaned up temporary Terraform directory"
+    fi
+
+    # Kill background processes
+    if [ -n "$PORT_FORWARD_PID" ]; then
+        kill $PORT_FORWARD_PID 2>/dev/null || true
+        log "INFO" "Terminated background port-forward process"
+    fi
+
+    if [ -n "$MONITOR_PID" ]; then
+        kill $MONITOR_PID 2>/dev/null || true
+        log "INFO" "Terminated background monitoring process"
+    fi
+
+    log "INFO" "Cleanup completed with exit code $exit_code"
+    exit $exit_code
+}
+
+# Set up trap handlers
+trap cleanup EXIT INT TERM
+
+main() {
+     set -e  # Exit on any error for safety
+
+     # Initialize cleanup variables
+     TMP_KUBECONFIG=""
+     TF_TMP_DIR=""
+     PORT_FORWARD_PID=""
+     MONITOR_PID=""
+
+     # Parse command line arguments
     DRY_RUN=false
     DEBUG=false
     METRIC="cpu+mem+gpu"
+    QUIET=false
     while [[ $# -gt 0 ]]; do
         case $1 in
             --dry-run)
@@ -22,6 +64,10 @@ main() {
                 ;;
             --debug)
                 DEBUG=true
+                shift
+                ;;
+            --quiet)
+                QUIET=true
                 shift
                 ;;
             --metric)
@@ -35,7 +81,7 @@ main() {
                 ;;
             *)
                 echo "Unknown option: $1"
-                echo "Usage: $0 [--dry-run] [--debug] [--metric cpu-only|cpu+mem|custom]"
+                echo "Usage: $0 [--dry-run] [--debug] [--quiet] [--metric cpu-only|cpu+mem|custom]"
                 exit 1
                 ;;
             esac
@@ -51,15 +97,10 @@ main() {
                     ;;
             esac
         
-            # Logging function for consistent output
-            log() {
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
-            }
-
 # Function to check if a command succeeds, with error handling
 check_command() {
     if ! "$@"; then
-        log "ERROR: Command failed: $@"
+        log "ERROR" "Command failed: $@"
         exit 1
     fi
 }
@@ -69,6 +110,12 @@ DEFAULT_REGION="DFW"
 DEFAULT_BID_PRICE="0.03"
 DEFAULT_NODE_COUNT="1"
 DEFAULT_KUBECONFIG_PATH="$HOME/.kube/config"
+# Magic number constants
+TIMEOUT_SECONDS=300
+BID_PRICE_SCALE_FACTOR=3
+HARDWARE_MONITORING_INTERVAL=60
+WEBHOOK_WARNING_MINUTES=5
+STORAGE_CLASS_COUNT_OFFSET=1
 
 # Function to validate spot API token (simple test API call)
 validate_spot_api_token() {
@@ -78,7 +125,7 @@ validate_spot_api_token() {
     local body=$(echo "$resp" | sed '$d')
 
     if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-        log "API token validated successfully."
+        log "INFO" "API token validated successfully."
         return 0
     else
         local msg=$(echo "$body" | jq -r '.message // .error // .errors[0].message // "unknown"' 2>/dev/null || echo "unknown")
@@ -451,12 +498,47 @@ if [ "$DEPLOYMENT_OPTION" = "Use existing" ]; then
        VALIDATE_RESPONSE='{"generation":"gen1"}'  # Mock response for dry-run
    fi
    
-   # Download kubeconfig
+   # Get kubeconfig using spot_kubeconfig data source
    if [ "$DRY_RUN" = false ]; then
        TMP_KUBECONFIG=$(mktemp)
-       curl -s -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/organizations/${SPOT_ORG_NAMESPACE}/cloudspaces/$CLOUDSPECES_ID/kubeconfig" > "$TMP_KUBECONFIG"
+       TF_TMP_DIR=$(mktemp -d)
+       cat > "$TF_TMP_DIR/main.tf" <<EOF
+terraform {
+ required_providers {
+   spot = {
+     source = "rackerlabs/spot"
+     version = "~> 0.1.4"
+   }
+ }
+}
+
+provider "spot" {
+ token = var.spot_token
+}
+
+data "spot_kubeconfig" "main" {
+ cloudspace_name = var.cloudspace_name
+}
+
+output "kubeconfig" {
+ value = data.spot_kubeconfig.main.raw
+ sensitive = true
+}
+EOF
+
+       cat > "$TMP_TF_DIR/terraform.tfvars" <<EOF
+spot_token = "${TOKEN}"
+cloudspace_name = "${CLOUDSPECES_ID}"
+EOF
+
+       cd "$TF_TMP_DIR"
+       terraform init -no-color > /dev/null 2>&1
+       terraform apply -auto-approve -no-color > /dev/null 2>&1
+       terraform output -raw kubeconfig > "$TMP_KUBECONFIG"
+       cd - > /dev/null
+       rm -rf "$TF_TMP_DIR"
    else
-       log "[DRY-RUN] Would download kubeconfig"
+       log "[DRY-RUN] Would get kubeconfig using spot_kubeconfig data source"
        TMP_KUBECONFIG=$(mktemp)
        echo "mock-kubeconfig-content" > "$TMP_KUBECONFIG"
    fi
@@ -783,15 +865,17 @@ fi
     # Start spot pricing monitoring
     if [ "$DRY_RUN" = false ]; then
         monitor_spot_pricing "$REGION" "$SERVER_CLASS" &
-        log "Spot pricing monitoring started in background."
+        MONITOR_PID=$!
+        log "Spot pricing monitoring started in background (PID: $MONITOR_PID)."
     else
         log "[DRY-RUN] Would start spot pricing monitoring"
     fi
 
     log "Provisioning complete!"
-}
+fi
 
 # Run main function if script is executed directly
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi
+}

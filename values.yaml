@@ -15,7 +15,7 @@ global:
   # Secret for code-server password
   secret:
     name: "code-server-password"
-    password: "defaultpassword"  # Default placeholder, override with --set global.secret.password='<your-password>'
+    password: ""  # Must be set via --set global.secret.password='<your-password>' or interactive install
     # Note: For interactive prompt, run: helm install --ask-values or set via --set
 
 # Deployment configuration for code-server
@@ -59,7 +59,7 @@ secret:
   name: "code-server-password"
   type: "Opaque"
   data:
-    password: "defaultpassword"  # Base64 encoded if needed, but here plain for simplicity; override interactively
+    password: ""  # Must be set via --set secret.data.password='<your-password>' or interactive install
 
 # Service configuration
 service:

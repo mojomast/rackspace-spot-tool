@@ -395,12 +395,47 @@ if [ "$DEPLOYMENT_OPTION" = "Use existing" ]; then
         VALIDATE_RESPONSE='{"generation":"gen1"}'  # Mock response for dry-run
     fi
 
-    # Download kubeconfig
+    # Get kubeconfig using spot_kubeconfig data source
     if [ "$DRY_RUN" = false ]; then
         TMP_KUBECONFIG=$(mktemp)
-        curl -s -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/organizations/${SPOT_ORG_NAMESPACE}/cloudspaces/$CLOUDSPECES_ID/kubeconfig" > "$TMP_KUBECONFIG"
+        TMP_TF_DIR=$(mktemp -d)
+        cat > "$TMP_TF_DIR/main.tf" <<EOF
+terraform {
+  required_providers {
+    spot = {
+      source = "rackerlabs/spot"
+      version = "~> 0.1.4"
+    }
+  }
+}
+
+provider "spot" {
+  token = var.spot_token
+}
+
+data "spot_kubeconfig" "main" {
+  cloudspace_name = var.cloudspace_name
+}
+
+output "kubeconfig" {
+  value = data.spot_kubeconfig.main.raw
+  sensitive = true
+}
+EOF
+
+        cat > "$TMP_TF_DIR/terraform.tfvars" <<EOF
+spot_token = "${TOKEN}"
+cloudspace_name = "${CLOUDSPECES_ID}"
+EOF
+
+        cd "$TMP_TF_DIR"
+        terraform init -no-color > /dev/null 2>&1
+        terraform apply -auto-approve -no-color > /dev/null 2>&1
+        terraform output -raw kubeconfig > "$TMP_KUBECONFIG"
+        cd - > /dev/null
+        rm -rf "$TMP_TF_DIR"
     else
-        log "[DRY-RUN] Would download kubeconfig"
+        log "[DRY-RUN] Would get kubeconfig using spot_kubeconfig data source"
         TMP_KUBECONFIG=$(mktemp)
         echo "mock-kubeconfig-content" > "$TMP_KUBECONFIG"
     fi
@@ -739,9 +774,9 @@ select SERVICE_TYPE in "LoadBalancer" "ClusterIP"; do
     esac
 done
 
-# Step 7: Add PascalIske Helm repo (idempotent)
-log "Adding PascalIske Helm repo for code-server"
-helm repo add pascaliske https://pascaliske.github.io/helm-charts >/dev/null 2>&1 || log "Helm repo may already exist"
+# Step 7: Add coder-saas Helm repo (idempotent)
+log "Adding coder-saas Helm repo for code-server"
+helm repo add coder-saas https://helm.coder.com/saas >/dev/null 2>&1 || log "Helm repo may already exist"
 check_command helm repo update
 log "Helm repo updated successfully"
 
@@ -772,7 +807,7 @@ log "values.yaml generated successfully"
 # Step 9: Run Helm install/upgrade for code-server
 if [ "$DRY_RUN" = false ]; then
     log "Installing/upgrading code-server via Helm"
-    HELM_CMD="helm upgrade --install code-server pascaliske/code-server --namespace \"$NAMESPACE\" --values deploy-values.yaml"
+    HELM_CMD="helm upgrade --install code-server coder-saas/code-server --namespace \"$NAMESPACE\" --values deploy-values.yaml"
     if [ "$GPU_ENABLED" = "true" ]; then
         HELM_CMD="$HELM_CMD --set gpu.enabled=true"
         HELM_CMD="$HELM_CMD --set gpu.resources.limits.nvidia\\.com/gpu=$GPU_COUNT"
@@ -922,7 +957,7 @@ log "VS Code access wizard complete"
 if [ -n "$SERVER_CLASS" ]; then
   monitor_spot_pricing "$REGION" "$SERVER_CLASS" &
   log "Spot pricing monitoring started in background."
-}
+fi
 
 # Run main function if script is executed directly
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

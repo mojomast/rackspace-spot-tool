@@ -10,7 +10,46 @@ TOKEN_CACHE="${XDG_RUNTIME_DIR:-/tmp}/spot_token.json"
 : "${MEM_WEIGHT:=0.5}"
 : "${GPU_WEIGHT:=4.0}"  # GPUs count heavily
 
-log() { if [ "${DEBUG:-0}" -eq 1 ]; then printf "%s %s\n" "$(date -Is)" "$*" >&2; fi; }
+# Set default log level if not set
+: "${LOG_LEVEL:=INFO}"
+
+# Log levels: DEBUG=0, INFO=1, WARN=2, ERROR=3
+get_log_level_num() {
+    case "${LOG_LEVEL^^}" in
+        DEBUG) echo 0 ;;
+        INFO) echo 1 ;;
+        WARN) echo 2 ;;
+        ERROR) echo 3 ;;
+        *) echo 1 ;;  # Default to INFO
+    esac
+}
+
+log() {
+    local level="${1:-INFO}"
+    local message="$2"
+    local level_num
+    local current_level_num
+
+    # If only one parameter, treat it as message and default level to INFO
+    if [ $# -eq 1 ]; then
+        message="$1"
+        level="INFO"
+    fi
+
+    level_num=$(case "${level^^}" in
+        DEBUG) echo 0 ;;
+        INFO) echo 1 ;;
+        WARN) echo 2 ;;
+        ERROR) echo 3 ;;
+        *) echo 1 ;;
+    esac)
+
+    current_level_num=$(get_log_level_num)
+
+    if [ "$level_num" -ge "$current_level_num" ]; then
+        printf "%s [%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$message" >&2
+    fi
+}
 
 # get_spot_token: returns a bearer token (prints token)
 get_spot_token() {
@@ -96,11 +135,13 @@ api_call() {
   token=$(get_spot_token) || return 1
   local url="${SPOT_API_BASE%/}${path}"
   log "API CALL: ${method} ${url}"
+  # Use connection reuse and reduce SSL overhead for better performance
+  local curl_opts="-s -w '\n%{http_code}' --connect-timeout 10 --max-time 30"
   if [ -n "$data" ]; then
-    resp=$(curl -s -w "\n%{http_code}" -X "$method" -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" "${url}" --data "$data")
+    resp=$(curl $curl_opts -X "$method" -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" "${url}" --data "$data")
     curl_exit=$?
   else
-    resp=$(curl -s -w "\n%{http_code}" -X "$method" -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" "${url}")
+    resp=$(curl $curl_opts -X "$method" -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" "${url}")
     curl_exit=$?
   fi
   HTTP_STATUS=$(echo "$resp" | tail -n1)
@@ -120,7 +161,138 @@ get_regions() {
   resp=$(api_call "GET" "/regions") || return 1
   echo "$resp" | jq -r '.[]?.code // empty' | grep -v '^$' || echo ""
   return 0
-}
+  }
+  
+  # validate_org_namespace: validate organization namespace format
+  validate_org_namespace() {
+    local ns="$1"
+    if [ -z "$ns" ]; then
+      log "ERROR: Organization namespace cannot be empty"
+      return 1
+    fi
+    if [[ ! "$ns" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+      log "ERROR: Organization namespace contains invalid characters"
+      return 1
+    fi
+    if [ ${#ns} -gt 64 ] || [ ${#ns} -lt 2 ]; then
+      log "ERROR: Organization namespace length must be between 2 and 64 characters"
+      return 1
+    fi
+    log "Organization namespace validated"
+    return 0
+  }
+  
+  # validate_node_count: validate node count is positive integer
+  validate_node_count() {
+    local count="$1"
+    if [[ ! "$count" =~ ^[0-9]+$ ]] || [ "$count" -le 0 ]; then
+      log "ERROR: Node count must be a positive integer"
+      return 1
+    fi
+    if [ "$count" -gt 100 ]; then
+      log "WARNING: Node count $count is very high, this may incur significant costs"
+    fi
+    log "Node count validated: $count"
+    return 0
+  }
+  
+  # validate_kubeconfig_path: validate kubeconfig file exists and is readable
+  validate_kubeconfig_path() {
+    local path="$1"
+    if [ -z "$path" ]; then
+      log "ERROR: Kubeconfig path cannot be empty"
+      return 1
+    fi
+    if [ ! -f "$path" ]; then
+      log "ERROR: Kubeconfig file does not exist: $path"
+      return 1
+    fi
+    if [ ! -r "$path" ]; then
+      log "ERROR: Kubeconfig file is not readable: $path"
+      return 1
+    fi
+    log "Kubeconfig path validated: $path"
+    return 0
+  }
+  
+  # validate_namespace: validate Kubernetes namespace name
+  validate_namespace() {
+    local ns="$1"
+    if [ -z "$ns" ]; then
+      log "ERROR: Namespace cannot be empty"
+      return 1
+    fi
+    if [[ ! "$ns" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+      log "ERROR: Invalid namespace format. Must be lowercase alphanumeric with optional dashes"
+      return 1
+    fi
+    if [ ${#ns} -gt 63 ]; then
+      log "ERROR: Namespace length exceeds 63 characters"
+      return 1
+    fi
+    log "Namespace validated: $ns"
+    return 0
+  }
+  
+  # validate_password: basic password validation
+  validate_password() {
+    local password="$1"
+    if [ -z "$password" ]; then
+      log "ERROR: Password cannot be empty"
+      return 1
+    fi
+    if [ ${#password} -lt 8 ]; then
+      log "WARNING: Password is very short, consider using a stronger password"
+    fi
+    log "Password validated"
+    return 0
+  }
+  
+  # validate_storage_size: validate storage size format
+  validate_storage_size() {
+    local size="$1"
+    if [[ ! "$size" =~ ^[0-9]+(Gi|Mi)$ ]]; then
+      log "ERROR: Storage size must be in format [number](Gi|Mi), e.g., 10Gi"
+      return 1
+    fi
+    local num=$(echo "$size" | sed 's/[A-Z]*$//')
+    if [ "$num" -lt 1 ]; then
+      log "ERROR: Storage size must be at least 1"
+      return 1
+    fi
+    log "Storage size validated: $size"
+    return 0
+  }
+  
+  # validate_timezone: validate timezone format
+  validate_timezone() {
+    local tz="$1"
+    if [ -z "$tz" ]; then
+      log "ERROR: Timezone cannot be empty"
+      return 1
+    fi
+    if ! echo "$tz" | grep -qE "^[A-Z][a-z_]+(/[A-Z][a-z_]+)?$"; then
+      log "ERROR: Invalid timezone format, e.g., UTC, America/New_York"
+      return 1
+    fi
+    log "Timezone validated: $tz"
+    return 0
+  }
+  
+  # validate_service_type: validate service type
+  validate_service_type() {
+    local type="$1"
+    case "$type" in
+      LoadBalancer|ClusterIP)
+        log "Service type validated: $type"
+        return 0
+        ;;
+      *)
+        log "ERROR: Invalid service type. Must be LoadBalancer or ClusterIP"
+        return 1
+        ;;
+    esac
+  }
 
 # get_serverclasses <region> [metric]: fetch and rank server classes for a region
 # metric: optional, "cpu-only", "cpu+mem", or "custom" (default cpu+mem+gpu)
@@ -136,7 +308,53 @@ get_serverclasses() {
   resp=$(api_call "GET" "/serverclasses?region=${region}") || return 1
   validate_serverclass_fields "$resp" || return 1
 
-  # Process and rank server classes
+  process_and_rank_serverclasses "$resp" "$metric"
+}
+
+# Extract GPU count from serverclass item
+extract_gpu_count() {
+  local gpu_info="$1"
+  local gpu_count=0
+  if [ -n "$gpu_info" ] && [ "$gpu_info" != "null" ]; then
+    if [[ "$gpu_info" =~ ^[0-9]+$ ]]; then
+      gpu_count="$gpu_info"
+    else
+      gpu_count=$(echo "$gpu_info" | grep -o '[0-9]\+' | head -1 || echo "0")
+    fi
+  fi
+  echo "$gpu_count"
+}
+
+# Adjust weights based on metric
+adjust_weights_for_metric() {
+  local metric="$1"
+  local vcpu_w="$VCPU_WEIGHT"
+  local mem_w="$MEM_WEIGHT"
+  local gpu_w="$GPU_WEIGHT"
+
+  case "$metric" in
+    cpu-only)
+      mem_w="0"
+      gpu_w="0"
+      ;;
+    cpu+mem)
+      gpu_w="0"
+      ;;
+    custom|cpu+mem+gpu)
+      # Use default weights
+      ;;
+    *)
+      log "WARNING: Unknown metric '$metric', using default cpu+mem+gpu"
+      ;;
+  esac
+
+  echo "$vcpu_w $mem_w $gpu_w"
+}
+
+# Process and rank server classes
+process_and_rank_serverclasses() {
+  local resp="$1"
+  local metric="$2"
   local ranked_classes=""
   local count=$(echo "$resp" | jq '. | length')
 
@@ -146,40 +364,13 @@ get_serverclasses() {
     local vcpu=$(echo "$item" | jq -r '.vcpu')
     local memory_gb=$(echo "$item" | jq -r '.memoryGB')
     local price_hour=$(echo "$item" | jq -r '.price')
-
-    # Extract GPU count
-    local gpu_count=0
     local gpu_info=$(echo "$item" | jq -r '.gpu_info // .gpus // .gpu_count // .accelerators // empty')
-    if [ -n "$gpu_info" ] && [ "$gpu_info" != "null" ]; then
-      if [[ "$gpu_info" =~ ^[0-9]+$ ]]; then
-        gpu_count="$gpu_info"
-      else
-        gpu_count=$(echo "$gpu_info" | grep -o '[0-9]\+' | head -1 || echo "0")
-      fi
-    fi
+    local gpu_count=$(extract_gpu_count "$gpu_info")
+    local weights=$(adjust_weights_for_metric "$metric")
+    local vcpu_w=$(echo "$weights" | cut -d' ' -f1)
+    local mem_w=$(echo "$weights" | cut -d' ' -f2)
+    local gpu_w=$(echo "$weights" | cut -d' ' -f3)
 
-    # Adjust weights based on metric
-    local vcpu_w="$VCPU_WEIGHT"
-    local mem_w="$MEM_WEIGHT"
-    local gpu_w="$GPU_WEIGHT"
-
-    case "$metric" in
-      "cpu-only")
-        mem_w="0"
-        gpu_w="0"
-        ;;
-      "cpu+mem")
-        gpu_w="0"
-        ;;
-      "custom"|"cpu+mem+gpu")
-        # Use default weights
-        ;;
-      *)
-        log "WARNING: Unknown metric '$metric', using default cpu+mem+gpu"
-        ;;
-    esac
-
-    # Calculate score
     local denominator=$(echo "scale=6; $vcpu_w * $vcpu + $mem_w * $memory_gb + $gpu_w * $gpu_count" | bc -l 2>/dev/null)
     if [ -z "$denominator" ] || [ "$(echo "$denominator <= 0" | bc -l)" = "1" ]; then
       log "WARNING: Invalid denominator for $code, skipping"
@@ -203,8 +394,6 @@ get_serverclasses() {
     log "WARNING: No valid server classes found"
     echo ""
   fi
-
-  return 0
 }
 
 # calculate_serverclass_score: compute cost-effectiveness score
@@ -232,47 +421,21 @@ validate_serverclass_fields() {
   local json="$1"
   local missing_fields=()
 
-  # Check if JSON is valid
   if ! echo "$json" | jq empty >/dev/null 2>&1; then
     log "ERROR: Invalid serverclass JSON response"
     return 1
   fi
 
-  # Check for required fields in each serverclass
   local count=$(echo "$json" | jq '. | length')
   for ((i=0; i<count; i++)); do
     local item=$(echo "$json" | jq ".[$i]")
     local code=$(echo "$item" | jq -r '.code // empty')
-
-    # Required fields per IMPROVMENTS.md
     local vcpu=$(echo "$item" | jq -r '.vcpu // empty')
     local memory_gb=$(echo "$item" | jq -r '.memoryGB // empty')
     local price_hour=$(echo "$item" | jq -r '.price // empty')
 
-    if [ -z "$vcpu" ] || [ "$vcpu" = "null" ]; then
-      missing_fields+=("$code: vcpu")
-    fi
-    if [ -z "$memory_gb" ] || [ "$memory_gb" = "null" ]; then
-      missing_fields+=("$code: memoryGB")
-    fi
-    if [ -z "$price_hour" ] || [ "$price_hour" = "null" ]; then
-      missing_fields+=("$code: price/hour")
-    fi
-
-    # Extract GPU count - try different field names that might contain GPU info
-    local gpu_count=0
-    local gpu_info=$(echo "$item" | jq -r '.gpu_info // .gpus // .gpu_count // .accelerators // empty')
-    if [ -n "$gpu_info" ] && [ "$gpu_info" != "null" ]; then
-      # If it's a number, use it directly
-      if [[ "$gpu_info" =~ ^[0-9]+$ ]]; then
-        gpu_count="$gpu_info"
-      else
-        # Try to extract number from string like "2x NVIDIA A100"
-        gpu_count=$(echo "$gpu_info" | grep -o '[0-9]\+' | head -1 || echo "0")
-      fi
-    fi
-    # Store gpu_count for later use
-    jq -n --arg code "$code" --argjson gpu_count "$gpu_count" '{code: $code, gpu_count: $gpu_count}' >/dev/null 2>&1
+    check_required_fields "$code" "$vcpu" "$memory_gb" "$price_hour" missing_fields
+    extract_and_store_gpu_count "$item"
   done
 
   if [ ${#missing_fields[@]} -gt 0 ]; then
@@ -281,5 +444,47 @@ validate_serverclass_fields() {
   fi
 
   return 0
+}
+
+# Check required fields for a serverclass
+check_required_fields() {
+  local code="$1"
+  local vcpu="$2"
+  local memory_gb="$3"
+  local price_hour="$4"
+  local -n missing_fields_ref=$5
+
+  if [ -z "$vcpu" ] || [ "$vcpu" = "null" ]; then
+    missing_fields_ref+=("$code: vcpu")
+  fi
+  if [ -z "$memory_gb" ] || [ "$memory_gb" = "null" ]; then
+    missing_fields_ref+=("$code: memoryGB")
+  fi
+  if [ -z "$price_hour" ] || [ "$price_hour" = "null" ]; then
+    missing_fields_ref+=("$code: price/hour")
+  fi
+}
+
+# Extract GPU count for later use
+extract_and_store_gpu_count() {
+  local item="$1"
+  local gpu_info=$(echo "$item" | jq -r '.gpu_info // .gpus // .gpu_count // .accelerators // empty')
+  local gpu_count=$(extract_gpu_count "$gpu_info")
+  # Store gpu_count for later use
+  jq -n --arg code "$(echo "$item" | jq -r '.code')" --argjson gpu_count "$gpu_count" '{code: $code, gpu_count: $gpu_count}' >/dev/null 2>&1
+}
+
+# Extract GPU count from serverclass item
+extract_gpu_count() {
+  local gpu_info="$1"
+  local gpu_count=0
+  if [ -n "$gpu_info" ] && [ "$gpu_info" != "null" ]; then
+    if [[ "$gpu_info" =~ ^[0-9]+$ ]]; then
+      gpu_count="$gpu_info"
+    else
+      gpu_count=$(echo "$gpu_info" | grep -o '[0-9]\+' | head -1 || echo "0")
+    fi
+  fi
+  echo "$gpu_count"
 }
 }

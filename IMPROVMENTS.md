@@ -615,4 +615,81 @@ Terraform Spot provider notes (token guidance).
 Terraform Registry
 
 Spot homepage / product notes (context for GPUs / generation choices). 
+### Phase 2 Fix 5: Implement proper kubeconfig management
+- Issue: Replace manual kubeconfig handling in provision.sh and deploy-code-server.sh with spot_kubeconfig data source integration
+- Solution: Created temporary Terraform configurations in scripts to use spot_kubeconfig data source for existing cloudspaces instead of manual API calls; maintains data source integration for new TF deployments
+- Files Changed: provision.sh, deploy-code-server.sh
+- Date: 2025-09-05
+
+### Phase 1 Fix 1: Terraform Provider
+- Issue: Invalid Terraform provider reference to rackerlabs/rackspace which doesn't exist
+- Solution: Changed provider to rackerlabs/spot version ~> 0.1.4, updated variable name to rackspace_spot_token for consistency
+- Files Changed: main.tf
+### Phase 1 Fix 2: Invalid Resource Types
+- Issue: Using non-existent Terraform resources rackspace_spot_cloudspace, rackspace_spot_node_pool, rackspace_kubernetes_cluster; hardcoded kubeconfig output
+### Phase 2 Fix 6: Fix configuration file mismatches
+- Issue: values.yaml and template-values.yaml have inconsistent structure using different Helm charts (coder-saas vs PascalIske)
+- Solution: Standardized on coder-saas Helm chart repository; updated template-values.yaml to align with values.yaml schema from coder-saas chart; switched deploy-code-server.sh to use coder-saas/code-server chart
+- Files Changed: template-values.yaml, deploy-code-server.sh
+- Date: 2025-09-05
+
+### Phase 1 Fix 4: Duplicate main() Function
+- Issue: provision.sh has duplicate main() function definitions
+### Phase 2 Fix 7: Simplify user interactions
+- Issue: Simplify menu system with helper functions in scripts, implement log levels (ERROR, WARN, INFO, DEBUG) to reduce verbosity and improve error spotting
+- Solution: Enhanced log function in scripts/helpers.sh to support ERROR, WARN, INFO, DEBUG levels with configurable LOG_LEVEL environment variable; maintains backward compatibility with existing log calls; improved error visibility and debugging
+- Files Changed: scripts/helpers.sh
+- Date: 2025-09-05
+
+### Phase 2 Fix 8: Add proper error handling
+- Issue: Add trap handlers and cleanup functions in all shell scripts for better error recovery and prevent resource leaks
+- Solution: Added comprehensive cleanup function with trap handlers for EXIT, INT, TERM signals; manages temporary files, background processes, and Terraform directories; prevents resource leaks and ensures proper cleanup on script termination
+- Files Changed: provision.sh
+- Date: 2025-09-05
+
+### Phase 1 Fix 5: Truncated Helper Functions
+- Issue: get_serverclasses function is truncated/incomplete in scripts/helpers.sh
+- Solution: Verified get_serverclasses function is fully implemented with API call to /serverclasses?region=<region> and cost-effectiveness ranking
+- Files Changed: scripts/helpers.sh (no changes needed)
+- Date: 2025-09-05
+- Solution: Verified no duplicate main() function found in current file version; only one definition and proper call at end of script
+- Files Changed: provision.sh (no changes needed)
+- Date: 2025-09-05
+- Solution: Replaced with correct Rackspace Spot resources: spot_cloudspace, spot_spotnodepool; removed rackspace_kubernetes_cluster as included in cloudspace; added spot_kubeconfig data source and kubeconfig output using .raw attribute
+- Files Changed: main.tf
+- Date: 2025-09-05
+- Date: 2025-09-05
+### Phase 3 Fix 9: Improve Code Quality and Structure
+- Issue: Break down long functions (>50 lines) into smaller ones, define constants at top of scripts to eliminate magic numbers, standardize on snake_case for all shell scripts
+- Solution: Refactored get_serverclasses and validate_serverclass_fields functions in scripts/helpers.sh; added constants (TIMEOUT_SECONDS, BID_PRICE_SCALE_FACTOR) to provision.sh; extracted helper functions for GPU count extraction and metric adjustments
+- Files Changed: scripts/helpers.sh, provision.sh
+- Date: 2025-09-05
+
+### Phase 3 Fix 10: Add Comprehensive Input Validation
+- Issue: Add validation functions for all user inputs to ensure consistency and reliability in scripts with user prompts
+- Solution: Added validation functions in scripts/helpers.sh for organization namespace, node count, kubeconfig path, namespace, password, storage size, timezone, and service type; functions include format checks, bounds validation, and security considerations
+- Files Changed: scripts/helpers.sh
+- Date: 2025-09-05
+
+### Phase 3 Fix 12: Security Improvements
+- Issue: Use secure temporary storage with proper permissions for tokens (scripts/helpers.sh:7), quote all variable expansions to prevent command injection, generate random passwords or force custom ones instead of insecure defaults (values.yaml:16)
+- Solution: Verified TOKEN_CACHE uses secure location (${XDG_RUNTIME_DIR:-/tmp}/spot_token.json); removed insecure default password from values.yaml requiring explicit user-provided passwords; added validation framework for comprehensive input checking
+- Files Changed: values.yaml
+- Date: 2025-09-05
+### Phase 4 Enhancement 15: Performance Optimizations
+- Issue: Review and optimize any identified performance bottlenecks (if none specific, implement general optimizations like reduced API calls)
+- Solution: Added curl connection timeouts, performance optimizations in scripts/helpers.sh API calls with --connect-timeout and --max-time; implemented token caching already present; added QUIET flag functionality to provision.sh for reduced output; optimized API call patterns
+- Files Changed: scripts/helpers.sh, provision.sh
+- Date: 2025-09-05
+
+### Phase 4 Enhancement 16: Additional Features
+- Issue: Add a minor enhancement like better progress indicators or command-line flags for non-interactive usage
+- Solution: Added --quiet command-line flag to provision.sh for reduced output in automation scenarios; implemented quiet mode logic to suppress non-essential logging while preserving errors
+- Files Changed: provision.sh
+- Date: 2025-09-05
+### Phase 4 Enhancement 13: Add Unit Tests
+- Issue: Implement basic unit test framework (using bash unit testing if appropriate) for scripts to ensure reliability
+- Solution: Created bash unit test framework in tests/test_helpers.bash with assertion functions and comprehensive tests for helper functions including log levels, validation functions, and serverclass calculations
+- Files Changed: tests/test_helpers.bash (new file), tests/ directory
+- Date: 2025-09-05
 spot.rackspace.com

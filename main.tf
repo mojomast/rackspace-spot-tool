@@ -4,9 +4,9 @@
 
 terraform {
   required_providers {
-    rackspace = {
-      source = "rackerlabs/rackspace"  # Assumes Rackspace provider is installed; install with terraform init if needed
-      version = "~> 0.1"  # Pin to stable version for idempotency
+    spot = {
+      source = "rackerlabs/spot"
+      version = "~> 0.1.4"
     }
   }
 
@@ -14,7 +14,7 @@ terraform {
 }
 
 # Variable definitions with interactive prompts
-variable "spot_token" {
+variable "rackspace_spot_token" {
   description = "Rackspace Spot API Token (will be prompted interactively)"
   type        = string
   sensitive   = true  # Hides value in logs and outputs
@@ -102,16 +102,17 @@ variable "market_priceCaching_enabled" {
 }
 
 # Provider configuration for Rackspace Spot API
-provider "rackspace" {
-  token    = var.spot_token
-  endpoint = var.spot_api_base
-  region   = var.region
+provider "spot" {
+  token = var.rackspace_spot_token
 }
 
 # Rackspace Spot Cloudspace resource
-resource "rackspace_spot_cloudspace" "main" {
-  name   = "k8s-cloudspace-${var.region}"
-  region = var.region
+resource "spot_cloudspace" "main" {
+  cloudspace_name      = "k8s-cloudspace-${var.region}"
+  region              = var.region
+  hacontrol_plane     = false
+  kubernetes_version  = "1.29.6"
+  cni                 = "calico"
 
   # Error handling: Ensure cloudspace is created successfully
   lifecycle {
@@ -120,44 +121,30 @@ resource "rackspace_spot_cloudspace" "main" {
 }
 
 # Spot Node Pool resource
-resource "rackspace_spot_node_pool" "main" {
-  cloudspace_id = rackspace_spot_cloudspace.main.id
-  bid_price     = var.spot_bid
-  node_count    = var.node_count
-  node_type     = var.server_flavor  # Selected spot instance flavor
+resource "spot_spotnodepool" "main" {
+  cloudspace_name = spot_cloudspace.main.cloudspace_name
+  server_class    = var.server_flavor
+  bid_price       = var.spot_bid
+  autoscaling     = {
+    min_nodes = 2
+    max_nodes = var.node_count
+  }
 
   # Ensure dependencies are handled properly
-  depends_on = [rackspace_spot_cloudspace.main]
+  depends_on = [spot_cloudspace.main]
 
   lifecycle {
     create_before_destroy = true
   }
+# Get kubeconfig data source
+data "spot_kubeconfig" "main" {
+  cloudspace_name = spot_cloudspace.main.cloudspace_name
 }
 
-# Managed Kubernetes Control Plane resource
-resource "rackspace_kubernetes_cluster" "main" {
-  name           = "managed-k8s-${var.region}"
-  cloudspace_id  = rackspace_spot_cloudspace.main.id
-  node_pool_id   = rackspace_spot_node_pool.main.id
-  kubernetes_version = "1.24.0"  # Specify version for compatibility; update as needed
-  region         = var.region
-
-  depends_on = [rackspace_spot_node_pool.main]
-
-  # Enable additional security settings
-  tags = {
-    environment = "terraform-managed"
-    region      = var.region
-  }
-
-  lifecycle {
-    create_before_destroy = true
-  }
+# Output kubeconfig content
+output "kubeconfig" {
+  description = "Kubeconfig content for the cluster"
+  value = data.spot_kubeconfig.main.raw
+  sensitive = true
 }
-
-# Output for kubeconfig file path
-output "kubeconfig_path" {
-  description = "Path to the generated kubeconfig file"
-  value       = "/path/to/kubeconfig"  # Replace with actual path from cluster creation; typically ~/.kube/config or generated file
-  depends_on  = [rackspace_kubernetes_cluster.main]
 }

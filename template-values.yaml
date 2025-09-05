@@ -1,51 +1,74 @@
-# template-values.yaml: Helm values template for PascalIske code-server chart
+# template-values.yaml: Helm values template for coder-saas code-server chart
 # This file uses placeholder variables replaced by deploy-code-server.sh
-# Placeholders: ${NAMESPACE}, ${STORAGE_SIZE}, ${CODE_SERVER_PASSWORD}, ${TIMEZONE}, ${SERVICE_TYPE}
+# Placeholders: ${STORAGE_SIZE}, ${CODE_SERVER_PASSWORD}, ${SERVICE_TYPE}, ${GPU_ENABLED}, ${GPU_COUNT}
 
-# Image configuration for code-server
-image:
-  repository: codercom/code-server
-  tag: latest
+# Namespace for the deployment
+namespace: "code-server"
 
-# Volume configuration - use existing PVC created by Terraform
-volume:
-  enabled: true
-  existingClaim: code-server-pvc
-  size: ${STORAGE_SIZE}  # Not used if existingClaim is set, but kept for reference
+# Global settings for defaults
+global:
+  # PersistentVolumeClaim configuration
+  persistentVolumeClaim:
+    size: "${STORAGE_SIZE}"  # Override with desired size
 
-# Injector configuration (default for the chart)
-injector:
+  # Secret for code-server password
+  secret:
+    name: "code-server-password"
+    password: "${CODE_SERVER_PASSWORD}"  # Override with your password
+
+# Deployment configuration for code-server
+deployment:
   image:
-    repository: ghcr.io/pascaliske/injector
-    tag: latest
-
-# Config environment variables for code-server
-config:
+    repository: "ghcr.io/coder/code-server"
+    tag: "latest"
+  replicas: 1
   env:
     - name: PASSWORD
-      value: "${CODE_SERVER_PASSWORD}"
-    - name: TZ
-      value: "${TIMEZONE}"
-  yaml: ""
+      valueFrom:
+        secretKeyRef:
+          name: code-server-password  # Reference to the secret above
+          key: password
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+  # Volume mount for persistent storage
+  volumeMounts:
+    - name: data-vol
+      mountPath: "/home/coder/project"
+  volumes:
+    - name: data-vol
+      persistentVolumeClaim:
+        claimName: "code-server-pvc"  # Reference to PVC below
+
+# PersistentVolumeClaim
+persistentVolumeClaim:
+  name: "code-server-pvc"
+  size: "${STORAGE_SIZE}"  # Uses global.persistentVolumeClaim.size
+  accessModes:
+    - "ReadWriteOnce"
+  storageClassName: ""  # Leave empty for default
+
+# Secret for code-server password
+secret:
+  name: "code-server-password"
+  type: "Opaque"
+  data:
+    password: "${CODE_SERVER_PASSWORD}"  # Base64 encoded if needed
 
 # Service configuration
 service:
-  type: ${SERVICE_TYPE}
-  port: 80
-  annotations: {}
-
-# Ingress disabled since using LoadBalancer or ClusterIP
-ingress:
-  enabled: false
-
-# Spot-specific environment variables
-env:
-  - name: SPOT_REGION
-    value: "${SPOT_REGION}"
-  - name: SPOT_GENERATION
-    value: "${SPOT_GENERATION}"
-  - name: SPOT_WEBHOOK_URL
-    value: "${SPOT_WEBHOOK_URL}"
+  name: "code-server-service"
+  type: "${SERVICE_TYPE}"  # LoadBalancer or ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  annotations:
+    kubernetes.io/ingress.class: "nginx"  # Example annotation for ingress integration
 
 # GPU Support Configuration (enabled when GPU server classes are selected)
 gpu:
@@ -81,3 +104,37 @@ gpu:
       nvidia.com/gpu: ${GPU_COUNT:-0}  # Request GPUs based on server class selection
     requests:
       nvidia.com/gpu: ${GPU_COUNT:-0}
+
+# Spot-specific configurations
+spot:
+  # Webhook endpoints for preemption monitoring
+  webhooks:
+    preemption:
+      url: "https://webhook.example.com/preemption-handler"
+      events: ["preemption"]
+      warningMinutes: 5
+      enabled: false
+
+  # Bid management settings
+  bid:
+    strategy: "optimized"
+    markup: 0.10
+    minBid: 0.01
+    maxBid: 1.0
+
+  # Graceful shutdown settings
+  shutdown:
+    preemptionGracePeriod: 300
+    webhookTimeout: 10
+
+  # Market monitoring
+  monitoring:
+    priceUpdateInterval: 300
+    bidAdjustmentThreshold: 0.05
+
+# Additional configurations for idempotency
+metadata:
+  labels:
+    app: code-server
+    version: v1.0
+    spot-enabled: "true"
