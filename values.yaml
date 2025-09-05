@@ -74,6 +74,41 @@ service:
     kubernetes.io/ingress.class: "nginx"  # Example annotation for ingress integration if needed
     # Add error handling/logging via sidecar if required, but not defined here for simplicity
 
+# GPU Support Configuration
+gpu:
+  enabled: false  # Set to true when deploying to GPU-enabled node pools
+  nodeSelector:
+    nvidia.com/gpu: "present"  # Select nodes with NVIDIA GPUs
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Equal"
+      value: "present"
+      effect: "NoSchedule"
+  # NVIDIA GPU Device Plugin DaemonSet (required for GPU workloads)
+  devicePlugin:
+    enabled: true  # Enable NVIDIA device plugin when using GPU nodes
+    image:
+      repository: "nvcr.io/nvidia/k8s-device-plugin"
+      tag: "v0.14.1"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "100Mi"
+      limits:
+        cpu: "100m"
+        memory: "200Mi"
+    args:
+      - "--pass-device-specs"
+      - "--fail-on-init-error"
+      - "--device-list-strategy=envvar"
+  # GPU Resource Requests/Limits for code-server pod
+  resources:
+    limits:
+      nvidia.com/gpu: 1  # Request 1 GPU (adjust based on workload)
+    requests:
+      nvidia.com/gpu: 1
+
 # Spot-specific configurations
 spot:
   # Webhook endpoints for preemption monitoring (configure external endpoints)

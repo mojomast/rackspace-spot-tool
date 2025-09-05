@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Source helpers
+source scripts/helpers.sh
+
 # Pause script for code-server infrastructure on Rackspace Kubernetes
 # This script safely pauses the environment by draining pods and scaling down node pools
 # It is idempotent and includes logging and error handling
@@ -25,31 +28,24 @@ check_command() {
 
 # Function to validate spot API token
 validate_spot_api_token() {
-    local RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" https://api.spot.rackspace.com/v1/auth/validate)
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+    local resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/auth/validate")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 200 ]; then
-        if echo "$BODY" | jq -e '.valid' >/dev/null 2>&1; then
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        if echo "$body" | jq -e '.valid' >/dev/null 2>&1; then
             log "API token validated successfully."
         else
             log "ERROR: Token validation response indicates invalid token."
             exit 1
         fi
-    elif [ "$HTTP_CODE" -eq 401 ]; then
-        local ERROR_MSG=$(echo "$BODY" | jq -r '.error.message' 2>/dev/null || echo "Unauthorized")
-        log "ERROR: Invalid token - $ERROR_MSG"
-        exit 1
-    elif [ "$HTTP_CODE" -eq 429 ]; then
-        log "ERROR: Rate limit exceeded. Backing off and retrying..."
-        sleep 60
-        validate_spot_api_token
-    elif [ "$HTTP_CODE" -ge 500 ]; then
-        log "ERROR: Server error during token validation."
-        exit 1
     else
-        local ERROR_MSG=$(echo "$BODY" | jq -r '.error.message' 2>/dev/null || echo "Unknown error")
-        log "ERROR: Token validation failed ($HTTP_CODE) - $ERROR_MSG"
+        local msg=$(echo "$body" | jq -r '.message // .error // .errors[0].message // "unknown"' 2>/dev/null || echo "unknown")
+        echo "API error ${http_code}: $msg" >&2
+        if [ "$DEBUG" = true ]; then
+            echo "Full response: $body" >&2
+        fi
         exit 1
     fi
 }
@@ -58,24 +54,25 @@ validate_spot_api_token() {
 fetch_market_price() {
     local region=$1
     local server_class=$2
-    local RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" "https://api.spot.rackspace.com/v1/market/prices/${region}/servers/${server_class}")
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+    local resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/market/prices/${region}/servers/${server_class}")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 200 ]; then
-        local PRICE=$(echo "$BODY" | jq -r '.price // empty')
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        local PRICE=$(echo "$body" | jq -r '.price // empty')
         if [ -n "$PRICE" ] && [ "$PRICE" != "null" ]; then
             echo "$PRICE"
         else
             log "WARNING: Market price data not found for ${server_class} in ${region}"
             echo ""
         fi
-    elif [ "$HTTP_CODE" -eq 429 ]; then
+    elif [ "$http_code" -eq 429 ]; then
         log "WARNING: Rate limit exceeded for market price fetch. Retrying..."
         sleep 5
         fetch_market_price "$region" "$server_class"
     else
-        log "WARNING: Failed to fetch market price ($HTTP_CODE) - Using fallback"
+        log "WARNING: Failed to fetch market price (${http_code}) - Using fallback"
         echo ""
     fi
 }
@@ -84,42 +81,71 @@ fetch_market_price() {
 setup_preemption_webhook() {
     local cloudspace_id=$1
     local webhook_url="https://webhook.example.com/preemption-handler"  # Configure actual endpoint
-    local RESPONSE=$(curl -s -w "%{http_code}" -X POST -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" \
+    local resp=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer ${TOKEN}" \
         -H "Content-Type: application/json" \
         -d "{\"url\": \"$webhook_url\", \"events\": [\"preemption\"], \"warningMinutes\": 5}" \
-        "https://api.spot.rackspace.com/v1/webhooks/cloudspaces/${cloudspace_id}")
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+        "${SPOT_API_BASE%/}/webhooks/cloudspaces/${cloudspace_id}")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 201 ]; then
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
         log "Preemption webhook configured successfully for cloudspace $cloudspace_id"
-    elif [ "$HTTP_CODE" -eq 429 ]; then
+    elif [ "$http_code" -eq 429 ]; then
         log "WARNING: Rate limit hit for webhook setup - proceeding without"
     else
-        log "WARNING: Failed to setup preemption webhook ($HTTP_CODE)"
+        log "WARNING: Failed to setup preemption webhook (${http_code})"
     fi
 }
 
 # Function to monitor for preemption during scaling
 monitor_preemption_during_pause() {
     local cloudspace_id=$1
-    local RESPONSE=$(curl -s -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" "https://api.spot.rackspace.com/v1/cloudspaces/$cloudspace_id/preemption/status")
-    if echo "$RESPONSE" | jq -e '.preemptionNotice' >/dev/null 2>&1; then
-        log "WARNING: Preemption notice detected during pause - immediate nodes may be terminated"
-        log "Consider increasing bid price before resuming"
+    local resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/cloudspaces/$cloudspace_id/preemption/status")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
+
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        if echo "$body" | jq -e '.preemptionNotice' >/dev/null 2>&1; then
+            log "WARNING: Preemption notice detected during pause - immediate nodes may be terminated"
+            log "Consider increasing bid price before resuming"
+        fi
+    else
+        log "WARNING: Could not check preemption status (${http_code})"
     fi
 }
 
 log "Starting pause script"
 
-# Prompt for RACKSPACE_SPOT_API_TOKEN
-if [ -z "$RACKSPACE_SPOT_API_TOKEN" ]; then
-    read -p "Enter RACKSPACE_SPOT_API_TOKEN: " RACKSPACE_SPOT_API_TOKEN
+# Parse command line arguments
+DEBUG=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --debug)
+            DEBUG=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--debug]"
+            exit 1
+            ;;
+    esac
+done
+export DEBUG
+
+# Prompt for SPOT_API_TOKEN
+if [ -z "$SPOT_API_TOKEN" ]; then
+    read -p "Enter SPOT_API_TOKEN: " SPOT_API_TOKEN
 fi
-if [ -z "$RACKSPACE_SPOT_API_TOKEN" ]; then
-    log "ERROR: RACKSPACE_SPOT_API_TOKEN is required"
+if [ -z "$SPOT_API_TOKEN" ]; then
+    log "ERROR: SPOT_API_TOKEN is required"
     exit 1
 fi
+
+# Get token
+TOKEN=$(get_spot_token) || exit 1
 log "API token provided (masked)"
 
 # Validate API token
@@ -213,11 +239,12 @@ fi
 
 # Get cloudspace ID for preemption monitoring
 log "Retrieving cloudspace information..."
-CLOUDSPECES_RESPONSE=$(curl -s -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" "https://api.spot.rackspace.com/v1/cloudspaces/")
-if [ $? -ne 0 ]; then
-    log "WARNING: Failed to retrieve cloudspaces for $REGION"
-    CLOUDSPECES_ID=""
-else
+resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/cloudspaces/")
+curl_exit=$?
+http_code=$(echo "$resp" | tail -n1)
+CLOUDSPECES_RESPONSE=$(echo "$resp" | sed '$d')
+
+if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
     CLOUDSPECES_ID=$(echo "$CLOUDSPECES_RESPONSE" | jq -r ".[] | select(.region == \"$REGION\") | .id" | head -1)
     if [ -n "$CLOUDSPECES_ID" ]; then
         # Monitor for preemption before scaling down
@@ -227,6 +254,9 @@ else
     else
         log "WARNING: No cloudspace found in $REGION"
     fi
+else
+    log "WARNING: Failed to retrieve cloudspaces (${http_code})"
+    CLOUDSPECES_ID=""
 fi
 
 # Scale spot node pool to zero via Terraform

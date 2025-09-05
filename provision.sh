@@ -1,15 +1,60 @@
 #!/bin/bash
 
+# Source helpers
+source scripts/helpers.sh
+
 # provision.sh: Interactive script to provision infrastructure for code-server deployment on Rackspace using Terraform and Helm
 # This script prompts for necessary variables with defaults, initializes and applies Terraform for infrastructure,
 # sets up KUBECONFIG, installs code-server via Helm, waits for pods to be ready, and provides access instructions.
 
-set -e  # Exit on any error for safety
+main() {
+    set -e  # Exit on any error for safety
 
-# Logging function for consistent output
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
-}
+    # Parse command line arguments
+    DRY_RUN=false
+    DEBUG=false
+    METRIC="cpu+mem+gpu"
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --debug)
+                DEBUG=true
+                shift
+                ;;
+            --metric)
+                METRIC="$2"
+                shift
+                shift
+                ;;
+            --metric=*)
+                METRIC="${1#*=}"
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Usage: $0 [--dry-run] [--debug] [--metric cpu-only|cpu+mem|custom]"
+                exit 1
+                ;;
+            esac
+            done
+        
+            # Validate metric option
+            case "$METRIC" in
+                cpu-only|cpu+mem|custom|cpu+mem+gpu)
+                    ;;
+                *)
+                    echo "ERROR: Invalid metric option '$METRIC'. Valid options: cpu-only, cpu+mem, custom, cpu+mem+gpu"
+                    exit 1
+                    ;;
+            esac
+        
+            # Logging function for consistent output
+            log() {
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+            }
 
 # Function to check if a command succeeds, with error handling
 check_command() {
@@ -25,54 +70,44 @@ DEFAULT_BID_PRICE="0.03"
 DEFAULT_NODE_COUNT="1"
 DEFAULT_KUBECONFIG_PATH="$HOME/.kube/config"
 
-# Function to validate spot API token
+# Function to validate spot API token (simple test API call)
 validate_spot_api_token() {
-    local RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" https://api.spot.rackspace.com/v1/auth/validate)
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+    local resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/regions")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 200 ]; then
-        if echo "$BODY" | jq -e '.valid' >/dev/null 2>&1; then
-            log "API token validated successfully."
-        else
-            log "ERROR: Token validation response indicates invalid token."
-            exit 1
-        fi
-    elif [ "$HTTP_CODE" -eq 401 ]; then
-        local ERROR_MSG=$(echo "$BODY" | jq -r '.error.message' 2>/dev/null || echo "Unauthorized")
-        log "ERROR: Invalid token - $ERROR_MSG"
-        exit 1
-    elif [ "$HTTP_CODE" -eq 429 ]; then
-        log "ERROR: Rate limit exceeded. Please try again later."
-        exit 1
-    elif [ "$HTTP_CODE" -ge 500 ]; then
-        log "ERROR: Server error during token validation."
-        exit 1
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        log "API token validated successfully."
+        return 0
     else
-        local ERROR_MSG=$(echo "$BODY" | jq -r '.error.message' 2>/dev/null || echo "Unknown error")
-        log "ERROR: Token validation failed ($HTTP_CODE) - $ERROR_MSG"
+        local msg=$(echo "$body" | jq -r '.message // .error // .errors[0].message // "unknown"' 2>/dev/null || echo "unknown")
+        echo "API error ${http_code}: $msg" >&2
+        if [ "$DEBUG" = true ]; then
+            echo "Full response: $body" >&2
+        fi
         exit 1
     fi
 }
 
 # Function to display account limits and quotas
 get_rackspace_limits() {
-    local RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" https://api.spot.rackspace.com/v1/auth/limits)
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+    local resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/auth/limits")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 200 ]; then
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
         log "Current Account Limits and Quotas:"
-        echo "$BODY" | jq .
-    elif [ "$HTTP_CODE" -eq 401 ]; then
-        log "WARNING: Unable to retrieve limits - Token validation failed"
-    elif [ "$HTTP_CODE" -eq 429 ]; then
-        log "WARNING: Unable to retrieve limits - Rate limit exceeded"
-    elif [ "$HTTP_CODE" -ge 500 ]; then
-        log "WARNING: Unable to retrieve limits - Server error"
+        echo "$body" | jq .
+        return 0
     else
-        local ERROR_MSG=$(echo "$BODY" | jq -r '.error.message' 2>/dev/null || echo "Unknown error")
-        log "WARNING: Failed to retrieve limits ($HTTP_CODE) - $ERROR_MSG"
+        local msg=$(echo "$body" | jq -r '.message // .error // .errors[0].message // "unknown"' 2>/dev/null || echo "unknown")
+        echo "API error ${http_code}: $msg" >&2
+        if [ "$DEBUG" = true ]; then
+            echo "Full response: $body" >&2
+        fi
+        return 1
     fi
 }
 
@@ -169,12 +204,13 @@ monitor_spot_pricing() {
 fetch_market_price() {
     local region=$1
     local server_class=$2
-    local RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" "https://api.spot.rackspace.com/v1/market/prices/${region}/servers/${server_class}")
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+    local resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/market/prices/${region}/servers/${server_class}")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 200 ]; then
-        local PRICE=$(echo "$BODY" | jq -r '.price // empty')
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        local PRICE=$(echo "$body" | jq -r '.price // empty')
         if [ -n "$PRICE" ] && [ "$PRICE" != "null" ]; then
             echo "$PRICE"
         else
@@ -182,7 +218,7 @@ fetch_market_price() {
             echo ""
         fi
     else
-        log "WARNING: Failed to fetch market price ($HTTP_CODE) - Using default bid"
+        log "WARNING: Failed to fetch market price (${http_code}) - Using default bid"
         echo ""
     fi
 }
@@ -191,17 +227,18 @@ fetch_market_price() {
 setup_preemption_webhook() {
     local cloudspace_id=$1
     local webhook_url="https://example.com/webhook"  # Placeholder, customize as needed
-    local RESPONSE=$(curl -s -w "%{http_code}" -X POST -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" \
+    local resp=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer ${TOKEN}" \
         -H "Content-Type: application/json" \
         -d "{\"url\": \"$webhook_url\", \"events\": [\"preemption\"], \"warningMinutes\": 5}" \
-        "https://api.spot.rackspace.com/v1/webhooks/cloudspaces/${cloudspace_id}")
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+        "${SPOT_API_BASE%/}/webhooks/cloudspaces/${cloudspace_id}")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 201 ]; then
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
         log "Preemption webhook configured successfully for cloudspace $cloudspace_id"
     else
-        log "WARNING: Failed to setup preemption webhook ($HTTP_CODE)"
+        log "WARNING: Failed to setup preemption webhook (${http_code})"
     fi
 }
 
@@ -219,51 +256,84 @@ display_cost_estimation() {
 }
 
 # Prompt for required variables with defaults
-if [ -z "$RACKSPACE_SPOT_API_TOKEN" ]; then
-    read -p "Enter RACKSPACE_SPOT_API_TOKEN: " RACKSPACE_SPOT_API_TOKEN
+if [ -z "$SPOT_API_TOKEN" ]; then
+    read -p "Enter SPOT_API_TOKEN: " SPOT_API_TOKEN
 fi
-if [ -z "$RACKSPACE_SPOT_API_TOKEN" ]; then
-    log "ERROR: RACKSPACE_SPOT_API_TOKEN is required"
+if [ -z "$SPOT_API_TOKEN" ] && [ -z "$SPOT_CLIENT_ID$SPOT_CLIENT_SECRET" ]; then
+    log "ERROR: SPOT_API_TOKEN or SPOT_CLIENT_ID+SPOT_CLIENT_SECRET is required"
     exit 1
 fi
 
+# Get token
+TOKEN=$(get_spot_token) || exit 1
+
 # Validate API token
 log "Validating API token..."
-validate_spot_api_token
+if [ "$DRY_RUN" = false ]; then
+    validate_spot_api_token
+else
+    log "[DRY-RUN] Would validate API token"
+fi
+
+# Ensure organization namespace is set and accessible
+if [ -z "$SPOT_ORG_NAMESPACE" ]; then
+    read -p "Enter SPOT_ORG_NAMESPACE: " SPOT_ORG_NAMESPACE
+fi
+if [ "$DRY_RUN" = false ]; then
+    ensure_org_namespace || exit 1
+else
+    log "[DRY-RUN] Would validate organization namespace"
+fi
 
 # Display account limits
 log "Retrieving account limits..."
-get_rackspace_limits
+if [ "$DRY_RUN" = false ]; then
+    get_rackspace_limits
+else
+    log "[DRY-RUN] Would retrieve account limits"
+fi
 
 # Select REGION with interactive menu
-log "Select the REGION for deployment:"
-echo "Generation-2:"
-echo "1. us-west-sjc-1 (San Jose, CA) - NEW GPU-enabled location"
-echo "2. us-central-dfw-1 (Dallas, TX)"
-echo "3. us-east-iad-1 (Ashburn, VA) - Coming Soon"
-echo "Generation-1:"
-echo "4. us-east-iad-1 (Ashburn, VA)"
-echo "5. us-central-dfw-1 (Dallas, TX)"
-echo "6. us-central-ord-1 (Chicago, IL)"
-echo "7. eu-west-lon-1 (London, UK)"
-echo "8. apac-se-syd-1 (Sydney, Australia)"
-echo "9. apac-se-hkg-1 (Hong Kong)"
-PS3="Enter your choice (1-9): "
-select REGION_DESC in "us-west-sjc-1 (San Jose, CA) - NEW GPU-enabled location" "us-central-dfw-1 (Dallas, TX)" "us-east-iad-1 (Ashburn, VA) - Coming Soon" "us-east-iad-1 (Ashburn, VA)" "us-central-dfw-1 (Dallas, TX)" "us-central-ord-1 (Chicago, IL)" "eu-west-lon-1 (London, UK)" "apac-se-syd-1 (Sydney, Australia)" "apac-se-hkg-1 (Hong Kong)"
+log "Fetching available regions..."
+if [ "$DRY_RUN" = false ]; then
+  REGION_LIST=$(get_regions)
+  if [ -z "$REGION_LIST" ]; then
+    log "ERROR: Failed to fetch regions from API"
+    exit 1
+  fi
+else
+  log "[DRY-RUN] Would fetch regions from API"
+  REGION_LIST="us-west-sjc-1 us-central-dfw-1 us-east-iad-1 us-central-ord-1 eu-west-lon-1 apac-se-syd-1 apac-se-hkg-1"
+fi
+
+REGION_ARRAY=($REGION_LIST)
+echo "Available regions:"
+for i in "${!REGION_ARRAY[@]}"; do
+  echo "$((i+1)). ${REGION_ARRAY[$i]}"
+done
+PS3="Enter your choice: "
+select REGION in "${REGION_ARRAY[@]}"
 do
-  case $REPLY in
-    1) REGION="us-west-sjc-1"; log "Selected REGION: us-west-sjc-1 (Generation-2)"; gen="gen2"; break;;
-    2) REGION="us-central-dfw-1"; log "Selected REGION: us-central-dfw-1 (Generation-2)"; gen="gen2"; break;;
-    3) REGION="us-east-iad-1"; log "Selected REGION: us-east-iad-1 (Generation-2)"; gen="gen2"; break;;
-    4) REGION="us-east-iad-1"; log "Selected REGION: us-east-iad-1 (Generation-1)"; gen="gen1"; break;;
-    5) REGION="us-central-dfw-1"; log "Selected REGION: us-central-dfw-1 (Generation-1)"; gen="gen1"; break;;
-    6) REGION="us-central-ord-1"; log "Selected REGION: us-central-ord-1 (Generation-1)"; gen="gen1"; break;;
-    7) REGION="eu-west-lon-1"; log "Selected REGION: eu-west-lon-1 (Generation-1)"; gen="gen1"; break;;
-    8) REGION="apac-se-syd-1"; log "Selected REGION: apac-se-syd-1 (Generation-1)"; gen="gen1"; break;;
-    9) REGION="apac-se-hkg-1"; log "Selected REGION: apac-se-hkg-1 (Generation-1)"; gen="gen1"; break;;
-    "") log "No selection made, using default: us-east-iad-1 (Generation-1)"; REGION="us-east-iad-1"; gen="gen1"; break;;
-    *) log "Invalid selection ($REPLY). Please choose 1-9."; continue;;
-  esac
+  if [ -n "$REPLY" ]; then
+    if [[ "$REPLY" =~ ^[0-9]+$ ]] && [ "$REPLY" -ge 1 ] && [ "$REPLY" -le "${#REGION_ARRAY[@]}" ]; then
+      REGION="${REGION_ARRAY[$((REPLY-1))]}"
+      if [[ "$REGION" == "us-west-sjc-1" ]]; then
+        gen="gen2"
+      else
+        gen="gen1"
+      fi
+      log "Selected REGION: $REGION (${gen^^})"
+      break
+    else
+      log "Invalid selection ($REPLY). Please choose 1-${#REGION_ARRAY[@]}."
+      continue
+    fi
+  else
+    REGION="us-east-iad-1"
+    gen="gen1"
+    log "No selection made, using default: us-east-iad-1 (Generation-1)"
+    break
+  fi
 done
 # Select DEPLOYMENT_OPTION with interactive menu
 log "Select the DEPLOYMENT_OPTION for cloudspace deployment:"
@@ -281,10 +351,37 @@ do
 done
 if [ "$DEPLOYMENT_OPTION" = "Use existing" ]; then
     log "Fetching available cloudspaces..."
-    CLOUDSPECES_RESPONSE=$(curl -s -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" https://api.spot.rackspace.com/v1/cloudspaces/)
-    if ! echo "$CLOUDSPECES_RESPONSE" | jq empty > /dev/null 2>&1; then
-        log "ERROR: Failed to retrieve cloudspaces or invalid response"
-        exit 1
+    if [ "$DRY_RUN" = false ]; then
+        resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/organizations/${SPOT_ORG_NAMESPACE}/cloudspaces/")
+        curl_exit=$?
+        http_code=$(echo "$resp" | tail -n1)
+        CLOUDSPECES_RESPONSE=$(echo "$resp" | sed '$d')
+
+        if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            :  # ok
+        else
+            local msg=$(echo "$CLOUDSPECES_RESPONSE" | jq -r '.message // .error // .errors[0].message // "unknown"' 2>/dev/null || echo "unknown")
+            echo "API error ${http_code}: $msg" >&2
+            if [ "$DEBUG" = true ]; then
+                echo "Full response: $CLOUDSPECES_RESPONSE" >&2
+            fi
+            exit 1
+        fi
+
+        if ! echo "$CLOUDSPECES_RESPONSE" | jq empty > /dev/null 2>&1; then
+            log "ERROR: Failed to retrieve cloudspaces or invalid response"
+            exit 1
+        fi
+        # Validate organization/namespace in response
+        # For list, each item should have organization field
+        org_check=$(echo "$CLOUDSPECES_RESPONSE" | jq -r '.[0].organization // .[0].namespace // empty' 2>/dev/null || echo "")
+        if [ -n "$org_check" ] && [ "$org_check" != "$SPOT_ORG_NAMESPACE" ]; then
+            log "ERROR: Cloudspace organization/namespace '$org_check' does not match SPOT_ORG_NAMESPACE '$SPOT_ORG_NAMESPACE'"
+            exit 1
+        fi
+    else
+        log "[DRY-RUN] Would fetch available cloudspaces"
+        CLOUDSPECES_RESPONSE='[]'  # Mock empty response for dry-run
     fi
 
     # Check if there are any cloudspaces
@@ -325,16 +422,44 @@ if [ "$DEPLOYMENT_OPTION" = "Use existing" ]; then
    log "Selected cloudspace ID: $CLOUDSPECES_ID"
    
    # Validate cloudspace accessibility
-   VALIDATE_RESPONSE=$(curl -s -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" "https://api.spot.rackspace.com/v1/cloudspaces/$CLOUDSPECES_ID")
-   if [[ "$VALIDATE_RESPONSE" == *"404"* ]] || [[ "$VALIDATE_RESPONSE" == *'"error"'* ]]; then
-       log "ERROR: Unable to validate cloudspace access"
-       exit 1
+   if [ "$DRY_RUN" = false ]; then
+       resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/organizations/${SPOT_ORG_NAMESPACE}/cloudspaces/$CLOUDSPECES_ID")
+       curl_exit=$?
+       http_code=$(echo "$resp" | tail -n1)
+       VALIDATE_RESPONSE=$(echo "$resp" | sed '$d')
+
+       if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+           :  # ok
+       else
+           local msg=$(echo "$VALIDATE_RESPONSE" | jq -r '.message // .error // .errors[0].message // "unknown"' 2>/dev/null || echo "unknown")
+           echo "API error ${http_code}: $msg" >&2
+           if [ "$DEBUG" = true ]; then
+               echo "Full response: $VALIDATE_RESPONSE" >&2
+           fi
+           exit 1
+       fi
+
+       # Validate organization/namespace
+       org_check=$(echo "$VALIDATE_RESPONSE" | jq -r '.organization // .namespace // empty' 2>/dev/null || echo "")
+       if [ -n "$org_check" ] && [ "$org_check" != "$SPOT_ORG_NAMESPACE" ]; then
+           log "ERROR: Cloudspace organization/namespace '$org_check' does not match SPOT_ORG_NAMESPACE '$SPOT_ORG_NAMESPACE'"
+           exit 1
+       fi
+       log "Cloudspace accessibility validated."
+   else
+       log "[DRY-RUN] Would validate cloudspace accessibility"
+       VALIDATE_RESPONSE='{"generation":"gen1"}'  # Mock response for dry-run
    fi
-   log "Cloudspace accessibility validated."
    
    # Download kubeconfig
-   TMP_KUBECONFIG=$(mktemp)
-   curl -s -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" "https://api.spot.rackspace.com/v1/cloudspaces/$CLOUDSPECES_ID/kubeconfig" > "$TMP_KUBECONFIG"
+   if [ "$DRY_RUN" = false ]; then
+       TMP_KUBECONFIG=$(mktemp)
+       curl -s -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/organizations/${SPOT_ORG_NAMESPACE}/cloudspaces/$CLOUDSPECES_ID/kubeconfig" > "$TMP_KUBECONFIG"
+   else
+       log "[DRY-RUN] Would download kubeconfig"
+       TMP_KUBECONFIG=$(mktemp)
+       echo "mock-kubeconfig-content" > "$TMP_KUBECONFIG"
+   fi
    
    # Validate kubeconfig
    if [ ! -f "$TMP_KUBECONFIG" ] || [ ! -s "$TMP_KUBECONFIG" ]; then
@@ -355,12 +480,22 @@ if [ "$DEPLOYMENT_OPTION" = "Use existing" ]; then
    GEN=${GEN,,}  # lowercase
    log "Detected generation: $GEN"
    
-   NODEPOOLS_RESPONSE=$(curl -s -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" "https://api.spot.rackspace.com/v1/cloudspaces/$CLOUDSPECES_ID/nodepools/")
-   if ! echo "$NODEPOOLS_RESPONSE" | jq empty > /dev/null 2>&1; then
-       log "WARNING: Could not retrieve nodepools info"
-   else
+   resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/organizations/${SPOT_ORG_NAMESPACE}/cloudspaces/$CLOUDSPECES_ID/nodepools/")
+   curl_exit=$?
+   http_code=$(echo "$resp" | tail -n1)
+   NODEPOOLS_RESPONSE=$(echo "$resp" | sed '$d')
+
+   if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+       # Validate organization/namespace
+       org_check=$(echo "$NODEPOOLS_RESPONSE" | jq -r '.[0].organization // .[0].namespace // empty' 2>/dev/null || echo "")
+       if [ -n "$org_check" ] && [ "$org_check" != "$SPOT_ORG_NAMESPACE" ]; then
+           log "ERROR: Nodepool organization/namespace '$org_check' does not match SPOT_ORG_NAMESPACE '$SPOT_ORG_NAMESPACE'"
+           exit 1
+       fi
        # Assume required storage classes are managed via API; log status
        log "Storage classes checked via nodepools API."
+   else
+       log "WARNING: Could not retrieve nodepools info (${http_code})"
    fi
    
    # Optional: Check for load balancer (assume Helm will handle)
@@ -377,67 +512,73 @@ if [ "$DEPLOYMENT_OPTION" = "Use existing" ]; then
    check_command kubectl cluster-info
    log "Cluster connectivity verified."
 # Select SERVER_CLASS with interactive menu
-echo "Select the SERVER_CLASS ($gen compatible):"
-if [ "$gen" = "gen2" ]; then
-  server_options=(\
-    "gp1-medium (General Purpose 1)" \
-    "gp1-large (General Purpose 2)" \
-    "gp1-xlarge (General Purpose 3)" \
-    "gp1-2xlarge (General Purpose 4)" \
-    "gp1-4xlarge (General Purpose 5)" \
-    "ch1-large (Compute Heavy 7)" \
-    "ch1-xlarge (Compute Heavy 8)" \
-    "ch1-2xlarge (Compute Heavy 9)" \
-    "ch1-4xlarge (Compute Heavy 10)" \
-    "mh1-large (Memory Heavy 11)" \
-    "mh1-xlarge (Memory Heavy 12)" \
-    "mh1-2xlarge (Memory Heavy 13)" \
-    "mh1-4xlarge (Memory Heavy 14)" \
-    "gpu1-xlarge (GPU 15)" \
-    "gpu1-2xlarge (GPU 16)" \
-  )
+log "Fetching server classes for region $REGION (metric: $METRIC)..."
+if [ "$DRY_RUN" = false ]; then
+  SERVER_LIST=$(get_serverclasses "$REGION" "$METRIC")
+  if [ -z "$SERVER_LIST" ]; then
+    log "ERROR: Failed to fetch server classes for region $REGION"
+    exit 1
+  fi
 else
-  server_options=(\
-    "gp1-medium (General Purpose 1)" \
-    "gp1-large (General Purpose 2)" \
-    "gp1-xlarge (General Purpose 3)" \
-    "gp1-2xlarge (General Purpose 4)" \
-    "gp1-4xlarge (General Purpose 5)" \
-    "ch1-large (Compute Heavy 7)" \
-    "ch1-xlarge (Compute Heavy 8)" \
-    "ch1-2xlarge (Compute Heavy 9)" \
-    "ch1-4xlarge (Compute Heavy 10)" \
-    "mh1-large (Memory Heavy 11)" \
-    "mh1-xlarge (Memory Heavy 12)" \
-    "mh1-2xlarge (Memory Heavy 13)" \
-    "mh1-4xlarge (Memory Heavy 14)" \
-  )
+  log "[DRY-RUN] Would fetch server classes for region $REGION"
+  SERVER_LIST=$(cat <<EOF
+gp1-medium
+gp1-large
+gp1-xlarge
+gp1-2xlarge
+gp1-4xlarge
+ch1-large
+ch1-xlarge
+ch1-2xlarge
+ch1-4xlarge
+mh1-large
+mh1-xlarge
+mh1-2xlarge
+mh1-4xlarge
+gpu1-xlarge
+gpu1-2xlarge
+EOF
+)
 fi
+
+SERVER_ARRAY=($SERVER_LIST)
+echo "Available server classes for $REGION:"
+for i in "${!SERVER_ARRAY[@]}"; do
+  echo "$((i+1)). ${SERVER_ARRAY[$i]}"
+done
 PS3="Enter your choice: "
-select SERVER_CLASS_DESC in "${server_options[@]}"
+select SERVER_CLASS in "${SERVER_ARRAY[@]}"
 do
   if [ -n "$REPLY" ]; then
-    if [[ "$REPLY" =~ ^[0-9]+$ ]] && [ "$REPLY" -ge 1 ] && [ "$REPLY" -le "${#server_options[@]}" ]; then
-      SERVER_CLASS_DESC="${server_options[$((REPLY-1))]}"
-      SERVER_CLASS=$(echo "$SERVER_CLASS_DESC" | cut -d' ' -f1)
+    if [[ "$REPLY" =~ ^[0-9]+$ ]] && [ "$REPLY" -ge 1 ] && [ "$REPLY" -le "${#SERVER_ARRAY[@]}" ]; then
+      SERVER_CLASS="${SERVER_ARRAY[$((REPLY-1))]}"
       log "Selected SERVER_CLASS: $SERVER_CLASS ($gen)"
       break
     else
-      log "Invalid selection ($REPLY). Please choose 1-${#server_options[@]}."
+      log "Invalid selection ($REPLY). Please choose 1-${#SERVER_ARRAY[@]}."
       continue
     fi
   else
     SERVER_CLASS="gp1-medium"
-    log "No selection made, using default: gp1-medium (General Purpose 1)"
+    log "No selection made, using default: gp1-medium"
     break
   fi
 done
 
 # Check market availability
-check_market_availability "$REGION" "$SERVER_CLASS"
+if [ "$DRY_RUN" = false ]; then
+    check_market_availability "$REGION" "$SERVER_CLASS"
+else
+    log "[DRY-RUN] Would check market availability for $SERVER_CLASS in $REGION"
+fi
 
 # Fetch market price for bid strategy
-MARK_PRICE=$(fetch_market_price "$REGION" "$SERVER_CLASS")
+if [ "$DRY_RUN" = false ]; then
+    MARK_PRICE=$(fetch_market_price "$REGION" "$SERVER_CLASS")
+else
+    log "[DRY-RUN] Would fetch market price for $SERVER_CLASS in $REGION"
+    MARK_PRICE="0.05"  # Mock price for dry-run
+fi
 if [ -n "$MARK_PRICE" ]; then
     log "Fetched market price: $$\MARK_PRICE for $SERVER_CLASS in $REGION"
 else
@@ -525,18 +666,48 @@ fi
 read -p "Enter KUBECONFIG_PATH [$DEFAULT_KUBECONFIG_PATH]: " KUBECONFIG_PATH
 KUBECONFIG_PATH=${KUBECONFIG_PATH:-$DEFAULT_KUBECONFIG_PATH}
 
+# Export DEBUG for helpers
+export DEBUG
+
+# Detect GPU capabilities from selected server class
+GPU_ENABLED="false"
+GPU_COUNT="0"
+if [[ "$SERVER_CLASS" == gpu* ]]; then
+    log "Detected GPU server class: $SERVER_CLASS"
+    GPU_ENABLED="true"
+    # Extract GPU count from class name (e.g., gpu1.large -> 1, gpu2.2xlarge -> 2)
+    if [[ "$SERVER_CLASS" =~ gpu([0-9]+)\. ]]; then
+        GPU_COUNT="${BASH_REMATCH[1]}"
+        log "Extracted GPU count: $GPU_COUNT"
+    fi
+fi
+
 # Export variables for Terraform
-export TF_VAR_rackspace_spot_api_token="$RACKSPACE_SPOT_API_TOKEN"
+export TF_VAR_spot_token="${TOKEN}"
 export TF_VAR_region="$REGION"
 export TF_VAR_bid_price="$BID_PRICE"
 export TF_VAR_node_count="$NODE_COUNT"
 export TF_VAR_server_class="$SERVER_CLASS"
+export TF_VAR_organization_namespace="$SPOT_ORG_NAMESPACE"
+
+# Export GPU variables for Helm template substitution
+export GPU_ENABLED="$GPU_ENABLED"
+export GPU_COUNT="$GPU_COUNT"
+export GPU_DEVICE_PLUGIN_ENABLED="$GPU_ENABLED"
 
 log "Initializing Terraform..."
-check_command terraform init
+if [ "$DRY_RUN" = false ]; then
+    check_command terraform init
+else
+    log "[DRY-RUN] Would initialize Terraform"
+fi
 
 log "Applying Terraform configuration..."
-check_command terraform apply -auto-approve
+if [ "$DRY_RUN" = false ]; then
+    check_command terraform apply -auto-approve
+else
+    log "[DRY-RUN] Would apply Terraform configuration"
+fi
 
 # Retrieve KUBECONFIG from Terraform output and set it
 TF_KUBECONFIG=$(terraform output -json kubeconfig 2>/dev/null || echo "")
@@ -546,25 +717,54 @@ if [ -z "$TF_KUBECONFIG" ]; then
 fi
 
 log "Setting KUBECONFIG..."
-mkdir -p "$(dirname "$KUBECONFIG_PATH")"
-echo "$TF_KUBECONFIG" | jq -r . > "$KUBECONFIG_PATH"
-export KUBECONFIG="$KUBECONFIG_PATH"
+if [ "$DRY_RUN" = false ]; then
+    mkdir -p "$(dirname "$KUBECONFIG_PATH")"
+    echo "$TF_KUBECONFIG" | jq -r . > "$KUBECONFIG_PATH"
+    export KUBECONFIG="$KUBECONFIG_PATH"
+else
+    log "[DRY-RUN] Would set KUBECONFIG"
+    export KUBECONFIG="/tmp/mock-kubeconfig"
+    echo "mock-kubeconfig-content" > "$KUBECONFIG"
+fi
 
 # Test cluster connectivity
-if ! test_cluster_connectivity; then
-  exit 1
+if [ "$DRY_RUN" = false ]; then
+    if ! test_cluster_connectivity; then
+        exit 1
+    fi
+else
+    log "[DRY-RUN] Would test cluster connectivity"
 fi
 
 log "Installing code-server via Helm..."
-check_command helm repo add coder-saas https://helm.coder.com/saas 2>/dev/null || log "Helm repo may already exist"
-check_command helm repo update
-check_command helm upgrade --install code-server coder-saas/code-server --values values.yaml
+if [ "$DRY_RUN" = false ]; then
+    check_command helm repo add coder-saas https://helm.coder.com/saas 2>/dev/null || log "Helm repo may already exist"
+    check_command helm repo update
+
+    # Use template-values.yaml for GPU-enabled deployments, fallback to values.yaml
+    VALUES_FILE="values.yaml"
+    if [ "$GPU_ENABLED" = "true" ]; then
+        log "Using GPU-enabled configuration"
+        VALUES_FILE="template-values.yaml"
+    fi
+
+    check_command helm upgrade --install code-server coder-saas/code-server --values "$VALUES_FILE" \
+        --set "gpu.enabled=$GPU_ENABLED" \
+        --set "gpu.resources.limits.nvidia\.com/gpu=$GPU_COUNT" \
+        --set "gpu.resources.requests.nvidia\.com/gpu=$GPU_COUNT"
+else
+    log "[DRY-RUN] Would install code-server via Helm"
+fi
 
 # Get the namespace from values.yaml (assumes it contains namespace)
 NAMESPACE=$(grep '^namespace:' values.yaml | cut -d':' -f2 | tr -d ' ' 2>/dev/null || echo "default")
 
 log "Waiting for pods to be ready..."
-check_command kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=code-server -n "$NAMESPACE" --timeout=300s
+if [ "$DRY_RUN" = false ]; then
+    check_command kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=code-server -n "$NAMESPACE" --timeout=300s
+else
+    log "[DRY-RUN] Would wait for pods to be ready"
+fi
 
 # Retrieve external IP or load balancer
 EXTERNAL_IP=$(kubectl get svc -l app.kubernetes.io/name=code-server -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null)
@@ -580,8 +780,18 @@ else
     log "Then access at: http://localhost:8080"
 fi
 
-# Start spot pricing monitoring
-monitor_spot_pricing "$REGION" "$SERVER_CLASS" &
-log "Spot pricing monitoring started in background."
+    # Start spot pricing monitoring
+    if [ "$DRY_RUN" = false ]; then
+        monitor_spot_pricing "$REGION" "$SERVER_CLASS" &
+        log "Spot pricing monitoring started in background."
+    else
+        log "[DRY-RUN] Would start spot pricing monitoring"
+    fi
 
-log "Provisioning complete!"
+    log "Provisioning complete!"
+}
+
+# Run main function if script is executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

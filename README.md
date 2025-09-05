@@ -7,7 +7,7 @@ This project provides an automated solution to set up a remote Visual Studio Cod
 The environment allows you to run VS Code in your browser on spot-priced cloud resources, perfect for development, testing, or lightweight workloads.
 
 Key features include:
-- **Cost-effective hosting**: Uses Rackspace Spot instances with configurable bidding.
+- **Cost-effective hosting**: Uses Rackspace Spot instances with configurable bidding. API base URL is now centralized via `SPOT_API_BASE` environment variable.
 - **Automated provisioning**: Scripts handle infrastructure setup, deployment, and management.
 - **Flexible deployment**: Deploy code-server to existing infrastructure via separate deploy script.
 - **Persistent storage**: Configurable PVC for data retention.
@@ -32,18 +32,27 @@ This section guides you through the initial setup, including selecting options f
 
 ### Interactive Options Selection
 
-The scripts use numbered selection menus for key configuration options to simplify setup:
+The scripts use numbered selection menus for key configuration options to simplify setup. Region and server class options are now dynamically populated from the Rackspace Spot API:
 
 - **REGION** (in [`provision.sh`](provision.sh)):
-  - 1. us-west - Western US region (e.g., Seattle area)
-  - 2. us-central - Central US region (e.g., Chicago)
-  - 3. us-east - Eastern US region (e.g., Dallas - DFW)
-  - 4. eu-west - Western Europe region (e.g., London)
+  - Dynamically fetched from `GET /regions` API endpoint
+  - Options vary based on your account and available regions
+  - Script validates region accessibility before proceeding
 
-- **SERVER_FLAVOR** (in [`provision.sh`](provision.sh)):
-  - 1. m3.medium - 1 vCPU, 4GB RAM (cost-effective for lightweight workloads)
-  - 2. m3.large - 2 vCPU, 8GB RAM (balanced performance and cost)
-  - 3. m3.xlarge - 4 vCPU, 16GB RAM (high-performance for demanding applications)
+- **SERVER_CLASS** (in [`provision.sh`](provision.sh) and [`deploy-code-server.sh`](deploy-code-server.sh)):
+  - Dynamically fetched from `GET /serverclasses?region=<selected-region>` API endpoint
+  - Available options depend on your selected region
+  - Each server class includes validated fields: vCPU, memoryGB, price/hour, gpu_info (if present)
+  - Supports GPU-enabled instances based on region capabilities
+  - **Cost-effectiveness ranking**: Server classes are ranked by cost-effectiveness score
+    - Formula: `score = price_per_hour / (vcpu_weight * vCPUs + mem_weight * memory_gb + gpu_weight * gpu_count)`
+    - Default weights: `VCPU_WEIGHT=1.0`, `MEM_WEIGHT=0.5`, `GPU_WEIGHT=4.0`
+    - Adjustable via environment variables or `--metric` option
+  - `--metric` option controls ranking strategy:
+    - `cpu-only`: Only considers CPU cost
+    - `cpu+mem`: Ignores GPU costs
+    - `cpu+mem+gpu` (default): Full cost-effectiveness including GPUs
+    - `custom`: Use custom weights from environment variables
 
 - **SERVICE_TYPE** (in [`deploy-code-server.sh`](deploy-code-server.sh)):
   - 1. LoadBalancer - External access via public IP (e.g., for internet access)
@@ -65,36 +74,89 @@ The scripts use numbered selection menus for key configuration options to simpli
 
 To use the menus:
 1. Run the script (e.g., `./provision.sh`).
-2. Navigate menus using numbers (1-4, 1-3, etc.) and press Enter to select.
+2. Navigate menus using numbers and press Enter to select.
 3. For custom options like KUBECONFIG_PATH, choose the custom option and enter details when prompted.
+4. Region and server class options are fetched live from the Rackspace Spot API, ensuring current availability.
 
 ### Running the Scripts
 
 Execute the following scripts for different operations:
 
 1. **Provisioning Infrastructure** ([`provision.sh`](provision.sh)):
-   - Usage: `./provision.sh`
-   - Flags/Options: Interactive prompts for API keys (RACKSPACE_API_KEY, RACKSPACE_API_SECRET), BID_PRICE, NODE_COUNT, KUBECONFIG_PATH
-   - Typical Command: `./provision.sh` (prompts will guide you)
-   - Provisions infrastructure, sets up kubeconfig, and deploys code-server
+    - Usage: `./provision.sh [--dry-run] [--debug] [--metric cpu-only|cpu+mem|custom]`
+    - Flags/Options: `--dry-run` for validation, `--debug` for verbose error output, `--metric` for cost-effectiveness ranking strategy
+    - Environment Variables: Adjust weights with `VCPU_WEIGHT`, `MEM_WEIGHT`, `GPU_WEIGHT`
+    - Typical Command: `./provision.sh --metric cpu+mem+gpu` (uses full cost-effectiveness ranking)
+    - Provisions infrastructure, sets up kubeconfig, and deploys code-server
 
 2. **Deploying Code-Server** ([`deploy-code-server.sh`](deploy-code-server.sh)):
-   - Usage: `./deploy-code-server.sh`
-   - Flags/Options: Interactive prompts for NAMESPACE, CODE_SERVER_PASSWORD, STORAGE_SIZE, TIMEZONE, SERVICE_TYPE
+   - Usage: `./deploy-code-server.sh [--debug]`
+   - Flags/Options: `--debug` for verbose error output, Interactive prompts for NAMESPACE, CODE_SERVER_PASSWORD, STORAGE_SIZE, TIMEZONE, SERVICE_TYPE
    - Typical Command: `./deploy-code-server.sh` (assumes infrastructure exists)
-   - Deploys code-server to existing Kubernetes cluster
+   - Deploys code-server to existing Kubernetes cluster using dynamic API endpoints.
 
 3. **Pausing the Environment** ([`pause.sh`](pause.sh)):
-   - Usage: `./pause.sh`
-   - Flags/Options: None, but prompts for credentials and paths
+   - Usage: `./pause.sh [--debug]`
+   - Flags/Options: `--debug` for verbose error output, prompts for credentials and paths
    - Typical Command: `./pause.sh` (scales to zero nodes for cost savings)
 
-4. **Resuming the Environment** ([`resume.sh`](resume.sh)):
-   - Usage: `./resume.sh`
-   - Flags/Options: Prompts for credentials and node count
-   - Typical Command: `./resume.sh` (restores nodes and redeploys code-server)
+5. **Sanity Checks** ([`scripts/sanity-check.sh`](scripts/sanity-check.sh)):
+    - Usage: `./scripts/sanity-check.sh [--dry-run] [--debug]`
+    - Validates Rackspace Spot API connectivity and organization access
+    - Checks for available regions (expects >= 1) and cloudspaces
+    - Verifies Kubernetes cluster access if kubectl is available
+    - Returns non-zero exit code on failures with human-friendly error messages
+    - Typical Command: `./scripts/sanity-check.sh` (runs validation checks)
 
-Ensure scripts are executable: `chmod +x provision.sh deploy-code-server.sh pause.sh resume.sh`.
+4. **Resuming the Environment** ([`resume.sh`](resume.sh)):
+    - Usage: `./resume.sh [--debug]`
+    - Flags/Options: `--debug` for verbose error output, prompts for credentials and node count
+    - Typical Command: `./resume.sh` (restores nodes and redeploys code-server)
+
+Ensure scripts are executable: `chmod +x provision.sh deploy-code-server.sh pause.sh resume.sh scripts/sanity-check.sh`.
+
+### Terraform Configuration
+The main.tf file now uses the variable `spot_token` for authentication.
+
+To run Terraform commands:
+
+1. **Initialize Terraform** (install providers):
+   ```bash
+   terraform init
+   ```
+
+2. **Plan changes** (preview what will be created):
+   ```bash
+   terraform plan
+   ```
+
+3. **Apply changes** (provision infrastructure):
+   ```bash
+   terraform apply
+   ```
+
+To provide the token via environment variable:
+```bash
+export TF_VAR_spot_token="$SPOT_API_TOKEN"
+terraform plan
+```
+
+Or pass directly:
+```bash
+terraform plan -var="spot_token=$SPOT_API_TOKEN"
+```
+
+Copy `terraform.tfvars.example` to `terraform.tfvars` and customize the values for your deployment:
+```bash
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your values
+terraform apply -var-file=terraform.tfvars
+```
+
+To destroy resources:
+```bash
+terraform destroy
+```
 
 ### Accessing Code-Server
 
@@ -127,8 +189,80 @@ Before using this project, ensure you have the following installed and configure
 
 ### Rackspace Account Setup
 1. Create an account on [Rackspace.com](https://www.rackspace.com).
-2. Obtain your **API Key** and **API Secret** from the Rackspace Spot Control Panel (under Account > API Key Management).
+2. Obtain your **API Token** from the Rackspace Spot Control Panel or use OAuth client credentials.
 3. Ensure your account has permissions for Spot instances and Kubernetes resources.
+
+### Authentication Setup
+The scripts use token-based authentication with Rackspace Spot API.
+
+**Option 1: Direct API Token (Recommended)**
+- Set environment variable: `export SPOT_API_TOKEN="your-token-here"`
+- Obtain token from Rackspace Spot Control Panel.
+
+**Option 2: OAuth Client Credentials**
+- Set: `export SPOT_CLIENT_ID="your-client-id"`
+- Set: `export SPOT_CLIENT_SECRET="your-client-secret"`
+- The scripts will automatically obtain and cache tokens.
+
+Tokens are cached in `${XDG_RUNTIME_DIR:-/tmp}/spot_token.json` to avoid repeated requests.
+
+### Cost-Effectiveness Weights
+You can customize how server classes are ranked by adjusting the cost-effectiveness weights:
+
+- `VCPU_WEIGHT`: Weight for CPU cores (default: 1.0)
+- `MEM_WEIGHT`: Weight for memory in GB (default: 0.5)
+- `GPU_WEIGHT`: Weight for GPU count (default: 4.0)
+
+Example:
+```bash
+export VCPU_WEIGHT="1.0"
+export MEM_WEIGHT="1.0"    # Increase memory importance
+export GPU_WEIGHT="8.0"    # Increase GPU importance further
+```
+
+## GPU Support
+
+The tool now provides comprehensive GPU/accelerator server class support:
+
+### Features
+- **Automatic GPU Detection**: Scripts detect GPU-enabled server classes from Spot API responses
+- **Node Scheduling**: GPU workloads are automatically scheduled to GPU-enabled nodes using labels and taints
+- **Device Plugin**: NVIDIA GPU device plugin is deployed when GPU server classes are selected
+- **Resource Management**: GPU resources are properly allocated to workloads
+
+### Required Cluster Addons
+When deploying to GPU-enabled node pools, ensure the following cluster addons are available:
+
+1. **NVIDIA GPU Operator** (recommended):
+   ```bash
+   # Install NVIDIA GPU Operator via Helm
+   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+   helm repo update
+   helm install gpu-operator nvidia/gpu-operator
+   ```
+
+2. **NVIDIA Device Plugin** (alternative):
+   ```bash
+   kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.14.0/nvidia-device-plugin.yml
+   ```
+
+### GPU Server Classes
+The tool supports GPU-enabled server classes that include:
+- `gpu1-xlarge`: Single GPU configurations
+- `gpu1-2xlarge`: Dual GPU configurations
+- Additional GPU classes as available in your region
+
+### Configuration
+GPU settings are automatically configured based on the selected server class:
+- Node selectors: `nvidia.com/gpu: present`
+- Tolerations: `nvidia.com/gpu=present:NoSchedule`
+- Resource limits: Based on detected GPU count
+- Device plugin: Enabled automatically for GPU workloads
+
+### Organization Namespace
+- Set environment variable: `export SPOT_ORG_NAMESPACE="your-organization-namespace"`
+- This is required for scoping API calls to your organization's resources.
+- Obtain your organization namespace from the Rackspace Spot Control Panel or API documentation.
 
 ### Network Requirements
 - Ensure outbound connectivity for Terraform to reach Rackspace APIs.
@@ -138,13 +272,13 @@ Before using this project, ensure you have the following installed and configure
 
 1. Clone or download the project files to your local machine.
 2. Make scripts executable: `chmod +x provision.sh deploy-code-server.sh pause.sh resume.sh`.
-3. **Option A: Full provisioning** - Run the provisioning script: `./provision.sh`.
-   - Follow prompts to enter credentials and customize settings.
-   - Access code-server at the provided URL once deployment completes.
+3. **Option A: Full provisioning** - Run the provisioning script with the --dry-run flag for validation: `./provision.sh --dry-run`.
+   - This will validate the orchestration without making actual API calls or Terraform changes.
+   - If successful, run without --dry-run to execute the full provisioning: `./provision.sh`.
 4. **Option B: Deploy to existing infrastructure** - If infrastructure is already provisioned via Terraform and kubeconfig exists:
-    - Run: `./deploy-code-server.sh`.
-    - Follow prompts to customize code-server settings.
-    - Access code-server at the provided URL once deployment completes.
+   - Run: `./deploy-code-server.sh --dry-run` to validate the deployment process.
+   - This will simulate the Helm deployment without actually executing it.
+   - If successful, run without --dry-run to deploy: `./deploy-code-server.sh`.
 
 ## Sanity Checks (Validation Checklist)
 
@@ -314,10 +448,10 @@ The scripts use the following defaults; press Enter to accept them:
 | Prompt                | Default Value                  | Notes                                      |
 |-----------------------|--------------------------------|--------------------------------------------|
 | **Provisioning Script (provision.sh)** |                                |                                            |
-| REGION                | DFW (Dallas)                   | Rackspace Spot region; main.tf supports us-east, etc. |
+| REGION                | us-east-iad-1 (Ashburn, VA)    | Rackspace Spot region; dynamically fetched |
 | BID_PRICE            | 0.03 USD/hour                 | Spot bid; must be >0, <=1.0              |
 | NODE_COUNT           | 1                              | Desired nodes; 1-10                       |
-| KUBECONFIG_PATH      | ~/ .kube/config (expanded)     | Path to Kubernetes config               |
+| KUBECONFIG_PATH      | ~/.kube/config (expanded)     | Path to Kubernetes config               |
 | PVC_SIZE             | 10Gi                          | Storage size for code-server data         |
 | PASSWORD             | defaultpassword               | Code-server login; change immediately     |
 | **Deploy Script (deploy-code-server.sh)** |                         |                                            |
@@ -373,8 +507,18 @@ The scripts use the following defaults; press Enter to accept them:
    - Check current spot prices in Rackspace Spot console.
 
 7. **Permission or authentication errors**
-   - Re-enter API credentials; ensure no typos.
-   - Confirm account permissions for Rackspace Spot resources.
+    - Re-enter API credentials; ensure no typos.
+    - Confirm account permissions for Rackspace Spot resources.
+
+8. **Token expired or invalid (HTTP 401/403)**
+    - Check if SPOT_API_TOKEN is set and not expired.
+    - For client credentials, verify SPOT_CLIENT_ID and SPOT_CLIENT_SECRET.
+    - Delete cached token file: `rm -f ${XDG_RUNTIME_DIR:-/tmp}/spot_token.json`
+    - Obtain fresh token from Rackspace Spot Control Panel.
+
+9. **Namespace mismatch (HTTP 404)**
+    - Ensure SPOT_ORG_NAMESPACE is set if required by your account.
+    - Verify namespace exists in your Rackspace organization.
 
 For detailed logs, check script output or log files (e.g., `pause.log`).
 
@@ -395,3 +539,8 @@ For detailed logs, check script output or log files (e.g., `pause.log`).
 - **Environment Cleanup**: To destroy, use `terraform destroy` after pausing.
 - **Testing**: Dry-run suggestions in comments (e.g., `helm install --dry-run`).
 - **Updates**: Check for Helm chart updates via `helm repo update` periodically.
+- **API Base URL**: All API calls now use a centralized `SPOT_API_BASE` environment variable (default: https://spot.rackspace.com/api/v1).
+- **Dynamic Menus**: Region and server class selections are now dynamically populated from the Rackspace Spot API.
+- **Method Validation**: GET/POST methods are validated per official API documentation.
+- **Authentication**: Token-based auth flow is implemented consistently across all scripts.
+- **Error Handling**: Improved HTTP status validation and error reporting.

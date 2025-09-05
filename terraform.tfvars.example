@@ -1,0 +1,40 @@
+# Example Terraform variables file for Rackspace Spot
+# Copy this file to terraform.tfvars and customize the values
+# Run: cp terraform.tfvars.example terraform.tfvars
+
+# Rackspace Spot API Token - get this from the Spot control panel
+spot_token = "your-spot-api-token-here"
+
+# Rackspace Spot organization namespace
+organization_namespace = "your-organization-namespace"
+
+# Rackspace Spot API base URL - default is fine unless using a different endpoint
+spot_api_base = "https://spot.rackspace.com/api/v1"
+
+# Rackspace region (us-west, us-central, us-east, eu-west)
+region = "us-east"
+
+# Spot bid price in USD per hour (e.g., 0.05)
+spot_bid = 0.05
+
+# Desired number of spot nodes (1-10)
+node_count = 3
+
+# Spot instance flavor/type for nodes (m3.medium, m3.large, m3.xlarge, gpu1.xlarge, gpu1.2xlarge, ch1.xlarge)
+server_flavor = "m3.large"
+
+# Rackspace Spot generation (gen1 or gen2)
+generation = "gen2"
+
+# Optional: Webhook URL for preemption events
+preemption_webhook_url = ""
+
+# Storage class compatible with generation (genN-storageM)
+storage_class = "gen2-storage1"
+
+# Enable market price caching for API rate limiting
+market_priceCaching_enabled = true
+
+# To use this file:
+# 1. terraform init
+# 2. terraform apply -var-file=terraform.tfvars

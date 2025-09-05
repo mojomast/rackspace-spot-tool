@@ -1,10 +1,31 @@
 #!/bin/bash
 
+# Source helpers
+source scripts/helpers.sh
+#!/bin/bash
+
 # resume.sh - Interactive script to resume a Kubernetes cluster using Terraform and Helm
 # This script prompts for necessary credentials and paths, restores spot node count via Terraform,
 # waits for resources to be ready, and redeploys Helm charts for code-server.
 
 set -e  # Exit on any error for safety
+
+# Parse command line arguments
+DEBUG=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --debug)
+            DEBUG=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--debug]"
+            exit 1
+            ;;
+    esac
+done
+export DEBUG
 
 # Function for logging with timestamps
 log() {
@@ -27,31 +48,24 @@ error_exit() {
 
 # Function to validate spot API token
 validate_spot_api_token() {
-    local RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" https://api.spot.rackspace.com/v1/auth/validate)
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+    local resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/auth/validate")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 200 ]; then
-        if echo "$BODY" | jq -e '.valid' >/dev/null 2>&1; then
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        if echo "$body" | jq -e '.valid' >/dev/null 2>&1; then
             log "API token validated successfully."
         else
             log "ERROR: Token validation response indicates invalid token."
             exit 1
         fi
-    elif [ "$HTTP_CODE" -eq 401 ]; then
-        local ERROR_MSG=$(echo "$BODY" | jq -r '.error.message' 2>/dev/null || echo "Unauthorized")
-        log "ERROR: Invalid token - $ERROR_MSG"
-        exit 1
-    elif [ "$HTTP_CODE" -eq 429 ]; then
-        log "ERROR: Rate limit exceeded. Backing off and retrying..."
-        sleep 60
-        validate_spot_api_token
-    elif [ "$HTTP_CODE" -ge 500 ]; then
-        log "ERROR: Server error during token validation."
-        exit 1
     else
-        local ERROR_MSG=$(echo "$BODY" | jq -r '.error.message' 2>/dev/null || echo "Unknown error")
-        log "ERROR: Token validation failed ($HTTP_CODE) - $ERROR_MSG"
+        local msg=$(echo "$body" | jq -r '.message // .error // .errors[0].message // "unknown"' 2>/dev/null || echo "unknown")
+        echo "API error ${http_code}: $msg" >&2
+        if [ "$DEBUG" = true ]; then
+            echo "Full response: $body" >&2
+        fi
         exit 1
     fi
 }
@@ -60,24 +74,25 @@ validate_spot_api_token() {
 fetch_market_price() {
     local region=$1
     local server_class=$2
-    local RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $RACKSPACE_SPOT_API_TOKEN" "https://api.spot.rackspace.com/v1/market/prices/${region}/servers/${server_class}")
-    local HTTP_CODE="${RESPONSE##* }"
-    local BODY="${RESPONSE%* }"
+    local resp=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" "${SPOT_API_BASE%/}/market/prices/${region}/servers/${server_class}")
+    local curl_exit=$?
+    local http_code=$(echo "$resp" | tail -n1)
+    local body=$(echo "$resp" | sed '$d')
 
-    if [ "$HTTP_CODE" -eq 200 ]; then
-        local PRICE=$(echo "$BODY" | jq -r '.price // empty')
+    if [ $curl_exit -eq 0 ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        local PRICE=$(echo "$body" | jq -r '.price // empty')
         if [ -n "$PRICE" ] && [ "$PRICE" != "null" ]; then
             echo "$PRICE"
         else
             log "WARNING: Market price data not found for ${server_class} in ${region}"
             echo ""
         fi
-    elif [ "$HTTP_CODE" -eq 429 ]; then
+    elif [ "$http_code" -eq 429 ]; then
         log "WARNING: Rate limit exceeded for market price fetch. Retrying..."
         sleep 5
         fetch_market_price "$region" "$server_class"
     else
-        log "WARNING: Failed to fetch market price ($HTTP_CODE) - Using fallback"
+        log "WARNING: Failed to fetch market price (${http_code}) - Using fallback"
         echo ""
     fi
 }
@@ -106,14 +121,17 @@ optimize_bid_price() {
     echo "$current_bid"
 }
 
-# Prompt for RACKSPACE_SPOT_API_TOKEN
-if [ -z "$RACKSPACE_SPOT_API_TOKEN" ]; then
-    read -p "Enter RACKSPACE_SPOT_API_TOKEN: " RACKSPACE_SPOT_API_TOKEN
+# Prompt for SPOT_API_TOKEN
+if [ -z "$SPOT_API_TOKEN" ]; then
+    read -p "Enter SPOT_API_TOKEN: " SPOT_API_TOKEN
 fi
-if [ -z "$RACKSPACE_SPOT_API_TOKEN" ]; then
-    log "ERROR: RACKSPACE_SPOT_API_TOKEN is required"
+if [ -z "$SPOT_API_TOKEN" ]; then
+    log "ERROR: SPOT_API_TOKEN is required"
     exit 1
 fi
+
+# Get token
+TOKEN=$(get_spot_token) || exit 1
 log "API token provided (masked)"
 
 # Validate API token
@@ -206,7 +224,7 @@ fi
 log "INFO: Validated TERRAFORM_DIR: $TERRAFORM_DIR"
 
 # Export token and kubeconfig
-export RACKSPACE_SPOT_API_TOKEN
+export SPOT_API_TOKEN
 export KUBECONFIG="$KUBECONFIG_PATH"
 
 log "INFO: Exported token and KUBECONFIG to $KUBECONFIG_PATH"

@@ -14,7 +14,7 @@ terraform {
 }
 
 # Variable definitions with interactive prompts
-variable "rackspace_spot_api_token" {
+variable "spot_token" {
   description = "Rackspace Spot API Token (will be prompted interactively)"
   type        = string
   sensitive   = true  # Hides value in logs and outputs
@@ -36,6 +36,21 @@ variable "spot_bid" {
     condition     = var.spot_bid > 0 && var.spot_bid <= 1.0
     error_message = "Spot bid must be between 0.01 and 1.0 USD/hour"
   }
+}
+
+variable "organization_namespace" {
+  description = "Rackspace Spot organization namespace"
+  type        = string
+  validation {
+    condition     = length(var.organization_namespace) > 0
+    error_message = "Organization namespace must not be empty"
+  }
+}
+
+variable "spot_api_base" {
+  description = "Rackspace Spot API base URL"
+  type        = string
+  default     = "https://spot.rackspace.com/api/v1"
 }
 
 variable "node_count" {
@@ -88,8 +103,8 @@ variable "market_priceCaching_enabled" {
 
 # Provider configuration for Rackspace Spot API
 provider "rackspace" {
-  token    = var.rackspace_spot_api_token
-  endpoint = "https://api.spot.rackspace.com"
+  token    = var.spot_token
+  endpoint = var.spot_api_base
   region   = var.region
 }
 

@@ -46,3 +46,38 @@ env:
     value: "${SPOT_GENERATION}"
   - name: SPOT_WEBHOOK_URL
     value: "${SPOT_WEBHOOK_URL}"
+
+# GPU Support Configuration (enabled when GPU server classes are selected)
+gpu:
+  enabled: ${GPU_ENABLED:-false}  # Set to true when deploying to GPU-enabled node pools
+  nodeSelector:
+    nvidia.com/gpu: "present"  # Select nodes with NVIDIA GPUs
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Equal"
+      value: "present"
+      effect: "NoSchedule"
+  # NVIDIA GPU Device Plugin DaemonSet (required for GPU workloads)
+  devicePlugin:
+    enabled: ${GPU_DEVICE_PLUGIN_ENABLED:-false}  # Enable NVIDIA device plugin when using GPU nodes
+    image:
+      repository: "nvcr.io/nvidia/k8s-device-plugin"
+      tag: "v0.14.1"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "100Mi"
+      limits:
+        cpu: "100m"
+        memory: "200Mi"
+    args:
+      - "--pass-device-specs"
+      - "--fail-on-init-error"
+      - "--device-list-strategy=envvar"
+  # GPU Resource Requests/Limits for code-server pod
+  resources:
+    limits:
+      nvidia.com/gpu: ${GPU_COUNT:-0}  # Request GPUs based on server class selection
+    requests:
+      nvidia.com/gpu: ${GPU_COUNT:-0}
